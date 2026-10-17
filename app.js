@@ -598,70 +598,165 @@ VISTAS.publicar.despues = async () => {
   });
 };
 
-VISTAS.accesos = () => `<div class="pagehead"><div><div class="eyebrow">Administración</div><h1>Accesos</h1>
-  <p class="sub">Autoriza correos y asigna su rol. La persona entra a esta misma URL, elige <b>Activar mi acceso</b> con ese correo y confirma el mensaje que le llega.</p></div></div>
+// Gestión de cuentas: llama a la Edge Function "tablero-admin" (la service_role vive solo en el servidor).
+async function adminCuentas(cuerpo) {
+  const { data, error } = await SB.functions.invoke('tablero-admin', { body: cuerpo });
+  if (error) {
+    let msg = error.message;
+    try { const j = await error.context.json(); if (j && j.error) msg = j.error; } catch {}
+    throw new Error(msg);
+  }
+  if (data && data.error) throw new Error(data.error);
+  return data;
+}
+const claveSegura = (p) => p.length >= 12 && /[a-z]/.test(p) && /[A-Z]/.test(p) && /\d/.test(p);
+function generarClave() {
+  const grupos = ['ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '.-_!#%'];
+  const todos = grupos.join('');
+  const r = (n) => { const a = new Uint32Array(1); crypto.getRandomValues(a); return a[0] % n; };
+  const c = grupos.map((g) => g[r(g.length)]);
+  while (c.length < 16) c.push(todos[r(todos.length)]);
+  for (let i = c.length - 1; i > 0; i--) { const j = r(i + 1); [c[i], c[j]] = [c[j], c[i]]; }
+  return c.join('');
+}
+const usarGenerador = (e) => { const g = e.target.closest('[data-generar]'); if (!g) return; const inp = g.parentElement.querySelector('input'); inp.value = generarClave(); inp.select(); };
+const campoClave = (nombre, ph = 'Contraseña temporal') => `<span class="clave-campo"><input class="field" name="${nombre}" type="text" minlength="12" maxlength="72" required placeholder="${ph}" autocomplete="new-password" spellcheck="false"><button type="button" class="btn" data-generar="${nombre}" title="Generar contraseña segura">Generar</button></span>`;
+
+VISTAS.accesos = () => `<div class="pagehead"><div><div class="eyebrow">Administración</div><h1>Usuarios y accesos</h1>
+  <p class="sub">Crea cuentas, asigna roles, bloquea o desbloquea y restablece contraseñas. Cada acción queda en la bitácora (sin contraseñas).</p></div></div>
   <div class="grid g-3">
-    ${kpi('Administrador', 'Todo', 'Accesos, publicaciones, seguimiento y bitácora')}
+    ${kpi('Administrador', 'Todo', 'Usuarios, publicaciones, seguimiento y bitácora')}
     ${kpi('Edición', 'Publica y da seguimiento', 'Sube datos y actualiza el estado de hallazgos')}
     ${kpi('Consulta', 'Solo lectura', 'Ve el tablero completo')}
   </div>
-  <div class="card section"><div class="card-h"><h2>Agregar persona</h2></div>
-    <form id="accForm" class="toolbar" style="margin:0">
-      <input class="field" name="email" type="email" required placeholder="correo@dxc.com" style="min-width:240px" autocomplete="off">
-      <input class="field" name="nombre" maxlength="120" placeholder="Nombre" style="min-width:200px">
+  <div class="card section"><div class="card-h"><h2>Agregar usuario</h2><span class="muted">la cuenta queda activa de inmediato</span></div>
+    <form id="accForm" class="toolbar" style="margin:0" autocomplete="off">
+      <input class="field" name="email" type="email" required placeholder="correo@dxc.com" style="min-width:230px" autocomplete="off">
+      <input class="field" name="nombre" maxlength="120" placeholder="Nombre" style="min-width:180px">
       <select class="field" name="rol">${Object.entries(ROLES).map(([k, v]) => `<option value="${k}" ${k === 'consulta' ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>
-      <button class="btn primary">Agregar</button><span id="accMsg" class="small"></span>
-    </form></div>
-  <div class="card section"><div class="card-h"><h2>Personas autorizadas</h2><span class="muted" id="accCuenta"></span></div><div id="accTabla" class="muted">Cargando…</div></div>
+      ${campoClave('clave')}
+      <button class="btn primary">Crear usuario</button>
+    </form>
+    <p class="muted small" style="margin:10px 0 0">Mínimo 12 caracteres con mayúscula, minúscula y número. Comparte la contraseña temporal por un canal seguro y pide a la persona que la cambie con el botón 🔑 al entrar.</p>
+    <p id="accMsg" class="small msg"></p></div>
+  <div class="card section"><div class="card-h"><h2>Usuarios</h2><span class="muted" id="accCuenta"></span></div>
+    <div class="toolbar"><input class="field" id="accBusca" placeholder="Buscar correo o nombre…" style="min-width:240px"><span class="spacer"></span><button class="btn" data-csv="acc" data-n="usuarios_tablero">Exportar CSV</button></div>
+    <div id="accTabla" class="muted">Cargando…</div></div>
   <div class="card section"><div class="card-h"><h2>Bitácora</h2><span class="muted">últimos 100 movimientos</span></div><div id="bitTabla" class="muted">Cargando…</div></div>`;
 VISTAS.accesos.roles = ['admin'];
 VISTAS.accesos.despues = async () => {
-  const cargar = async () => {
-    const { data, error } = await SB.from('tablero_accesos').select('*').order('rol').order('email');
-    if (error) { $('#accTabla').textContent = 'Error: ' + error.message; return; }
-    $('#accCuenta').textContent = `${data.filter((x) => x.activo).length} activos de ${data.length}`;
+  const msg = (t, ok) => aviso('accMsg', t, ok);
+  let filas = [];
+  const pintar = () => {
+    const q = ($('#accBusca')?.value || '').toLowerCase();
+    const f = filas.filter((a) => !q || (a.email + ' ' + (a.nombre || '')).toLowerCase().includes(q));
+    const y = window.scrollY;
     $('#accTabla').innerHTML = tabla('acc', [
-      { k: 'email', t: 'Correo', html: (a) => `<span class="mono">${esc(a.email)}</span>${a.email === YO.email ? ' <span class="chip">tú</span>' : ''}` }, { k: 'nombre', t: 'Nombre' },
-      { k: 'rol', t: 'Rol', html: (a) => `<select class="field" data-accrol="${esc(a.email)}" style="height:30px">${Object.entries(ROLES).map(([k, v]) => `<option value="${k}" ${k === a.rol ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>`, csv: (a) => ROLES[a.rol] },
-      { k: 'activo', t: 'Estado', html: (a) => `<button class="btn" data-accact="${esc(a.email)}" data-v="${a.activo ? '0' : '1'}" style="height:30px">${a.activo ? '✓ Activo' : 'Suspendido'}</button>`, csv: (a) => (a.activo ? 'Activo' : 'Suspendido') },
-      { k: 'creado_en', t: 'Alta', html: (a) => `${esc(fHora(a.creado_en))}<div class="muted small">${esc(a.creado_por || '')}</div>` },
-      { k: 'x', t: '', html: (a) => (a.email === YO.email ? '' : `<button class="btn" data-accdel="${esc(a.email)}" style="height:30px">Eliminar</button>`) },
-    ], data);
+      { k: 'email', t: 'Correo', html: (a) => `<span class="mono">${esc(a.email)}</span>${a.email === YO.email ? ' <span class="chip">tú</span>' : ''}` },
+      { k: 'nombre', t: 'Nombre' },
+      { k: 'rol', t: 'Rol', html: (a) => (a.rol ? `<select class="field" data-accrol="${esc(a.email)}" style="height:30px">${Object.entries(ROLES).map(([k, v]) => `<option value="${k}" ${k === a.rol ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>` : '<span class="muted">sin acceso</span>'), csv: (a) => ROLES[a.rol] || 'sin acceso' },
+      { k: 'estado', t: 'Estado', html: (a) => st(a.estadoC, a.estado), sort: (a) => a.estado, csv: (a) => a.estado },
+      { k: 'ultimo', t: 'Último acceso', html: (a) => esc(a.ultimo ? fHora(a.ultimo) : 'Nunca'), sort: (a) => a.ultimo || '' },
+      { k: 'alta', t: 'Alta', html: (a) => `${esc(fHora(a.alta))}${a.creado_por ? `<div class="muted small">${esc(a.creado_por)}</div>` : ''}`, sort: (a) => a.alta || '' },
+      { k: 'acc', t: 'Acciones', html: (a) => {
+        const yoMismo = a.email === YO.email;
+        if (!a.rol && !a.cuenta) return '';
+        return `<span class="acciones">${!yoMismo ? (a.bloqueado ? `<button class="btn" data-acc="desbloquear" data-email="${esc(a.email)}">Desbloquear</button>` : `<button class="btn" data-acc="bloquear" data-email="${esc(a.email)}">Bloquear</button>`) : ''}
+          ${a.cuenta ? `<button class="btn" data-acc="password" data-email="${esc(a.email)}">Contraseña</button>` : `<button class="btn" data-acc="crearcuenta" data-email="${esc(a.email)}" data-rol="${esc(a.rol || 'consulta')}" data-nombre="${esc(a.nombre || '')}">Crear cuenta</button>`}
+          ${!yoMismo ? `<button class="btn" data-acc="eliminar" data-email="${esc(a.email)}">Eliminar</button>` : ''}</span>`;
+      }, csv: () => '' },
+    ], f, { orden: 'email' });
+    window.scrollTo(0, y);
+    $('#accCuenta').textContent = `${filas.filter((x) => x.estado === 'Activo').length} activos · ${filas.filter((x) => x.bloqueado).length} bloqueados · ${filas.length} en total`;
+  };
+  const cargar = async () => {
+    const [acc, cuentas] = await Promise.all([
+      SB.from('tablero_accesos').select('*'),
+      adminCuentas({ accion: 'listar' }).catch((e) => ({ error: e.message })),
+    ]);
+    if (acc.error) { $('#accTabla').textContent = 'Error: ' + acc.error.message; return; }
+    if (cuentas.error) msg('No se pudo consultar las cuentas (función tablero-admin): ' + cuentas.error);
+    const porEmail = new Map((cuentas.usuarios || []).map((u) => [u.email, u]));
+    const correos = new Set([...acc.data.map((a) => a.email), ...porEmail.keys()]);
+    filas = [...correos].map((email) => {
+      const a = acc.data.find((x) => x.email === email) || {}, u = porEmail.get(email);
+      const bloqueado = (u && u.bloqueado_hasta && new Date(u.bloqueado_hasta) > new Date()) || a.activo === false;
+      let estado, estadoC;
+      if (!a.rol) { estado = 'Cuenta sin acceso'; estadoC = 'sin-datos'; }
+      else if (bloqueado) { estado = 'Bloqueado'; estadoC = 'rojo'; }
+      else if (!u && cuentas.usuarios) { estado = 'Sin cuenta'; estadoC = 'amarillo'; }
+      else if (u && !u.confirmado) { estado = 'Sin confirmar'; estadoC = 'amarillo'; }
+      else { estado = 'Activo'; estadoC = 'verde'; }
+      return { email, nombre: a.nombre, rol: a.rol, bloqueado, estado, estadoC, cuenta: !!u, ultimo: u && u.ultimo_acceso, alta: a.creado_en || (u && u.creado), creado_por: a.creado_por };
+    });
+    pintar();
     const b = await SB.from('tablero_bitacora').select('*').order('fecha', { ascending: false }).limit(100);
     const ACC = { 'tablero_accesos.insert': 'Alta de acceso', 'tablero_accesos.update': 'Cambio de acceso', 'tablero_accesos.delete': 'Baja de acceso',
       'tablero_publicaciones.insert': 'Publicación de datos', 'tablero_publicaciones.delete': 'Eliminó publicación',
-      'tablero_seguimiento.insert': 'Seguimiento nuevo', 'tablero_seguimiento.update': 'Seguimiento actualizado', 'tablero_seguimiento.delete': 'Seguimiento eliminado' };
+      'tablero_seguimiento.insert': 'Seguimiento nuevo', 'tablero_seguimiento.update': 'Seguimiento actualizado', 'tablero_seguimiento.delete': 'Seguimiento eliminado',
+      'auth.crear': 'Creó cuenta', 'auth.bloquear': 'Bloqueó cuenta', 'auth.desbloquear': 'Desbloqueó cuenta', 'auth.password': 'Restableció contraseña', 'auth.eliminar': 'Eliminó cuenta' };
     const resumir = (x) => { const d = x.detalle || {}; const o = d.despues || d; const a = d.antes;
-      if (x.accion.startsWith('tablero_accesos')) return `${o.email || ''} → ${ROLES[o.rol] || o.rol || ''}${o.activo === false ? ' (suspendido)' : ''}${a && a.rol !== o.rol ? ` (antes ${ROLES[a.rol]})` : ''}`;
+      if (x.accion.startsWith('auth.')) return `${d.email || ''}${d.rol ? ' → ' + (ROLES[d.rol] || d.rol) : ''}`;
+      if (x.accion.startsWith('tablero_accesos')) return `${o.email || ''} → ${ROLES[o.rol] || o.rol || ''}${o.activo === false ? ' (bloqueado)' : ''}${a && a.rol !== o.rol ? ` (antes ${ROLES[a.rol]})` : ''}${a && a.activo !== o.activo ? (o.activo ? ' (desbloqueado)' : '') : ''}`;
       if (x.accion.startsWith('tablero_publicaciones')) return `#${d.id} · ${fMes(d.periodo)}${d.nota ? ' · ' + d.nota : ''}`;
       return `${o.sid || ''} · ${EST[o.estado] || ''} · ${String(o.hallazgo || '').slice(0, 90)}`; };
     $('#bitTabla').innerHTML = b.error ? 'Error: ' + esc(b.error.message) : tabla('bit', [{ k: 'fecha', t: 'Fecha', html: (x) => esc(fHora(x.fecha)) }, { k: 'usuario', t: 'Usuario', html: (x) => `<span class="mono">${esc(x.usuario)}</span>` },
       { k: 'accion', t: 'Acción', html: (x) => esc(ACC[x.accion] || x.accion) }, { k: 'detalle', t: 'Detalle', w: 300, html: (x) => esc(resumir(x)), csv: (x) => resumir(x) }], b.data);
   };
+  const ejecutar = async (cuerpo, okTxt, boton) => {
+    if (boton) boton.disabled = true;
+    try { await adminCuentas(cuerpo); msg(okTxt, true); await cargar(); return true; }
+    catch (e) { msg('No se pudo completar: ' + e.message); return false; }
+    finally { if (boton) boton.disabled = false; }
+  };
+  const dialogoClave = (email, crear) => {
+    const dlg = $('#dlg');
+    dlg.innerHTML = `<form method="dialog" id="fClave" class="dlg-form" autocomplete="off">
+      <div class="eyebrow">${crear ? 'Crear cuenta' : 'Restablecer contraseña'}</div>
+      <h2 style="margin:6px 0 14px" class="mono">${esc(email)}</h2>
+      <label>Nueva contraseña ${campoClave('clave', 'Mínimo 12: mayúscula, minúscula y número')}</label>
+      <p class="muted small">Se aplica de inmediato. Compártela por un canal seguro; la persona puede cambiarla con 🔑.</p>
+      <p class="msg small" id="claveMsg"></p>
+      <div class="toolbar" style="justify-content:flex-end;margin:0"><button class="btn" value="cancelar" formnovalidate>Cancelar</button><button class="btn primary" id="claveOk">${crear ? 'Crear cuenta' : 'Guardar contraseña'}</button></div></form>`;
+    dlg.showModal();
+    $('#fClave').addEventListener('click', usarGenerador);
+    return new Promise((res) => {
+      dlg.addEventListener('close', () => res(null), { once: true });
+      $('#claveOk').addEventListener('click', (e) => {
+        e.preventDefault();
+        const v = $('#fClave').clave.value;
+        if (!claveSegura(v)) { $('#claveMsg').textContent = 'Debe tener 12+ caracteres con mayúscula, minúscula y número.'; $('#claveMsg').style.color = 'var(--crit)'; return; }
+        res(v); dlg.close();
+      });
+    });
+  };
+
   await cargar();
+  app.querySelector('#accBusca').addEventListener('input', pintar);
+  $('#accForm').addEventListener('click', usarGenerador);
   $('#accForm').addEventListener('submit', async (e) => {
     e.preventDefault();
     const f = new FormData(e.target);
-    const fila = { email: String(f.get('email')).trim().toLowerCase(), nombre: String(f.get('nombre')).trim() || null, rol: f.get('rol') };
-    const { error } = await SB.from('tablero_accesos').insert(fila);
-    if (error) { aviso('accMsg', error.code === '23505' ? 'Ese correo ya está registrado.' : 'Error: ' + error.message); return; }
-    aviso('accMsg', `✓ ${fila.email} autorizado como ${ROLES[fila.rol]}.`, true); e.target.reset(); await cargar();
+    const email = String(f.get('email')).trim().toLowerCase(), clave = String(f.get('clave'));
+    if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return msg('Correo inválido.');
+    if (!claveSegura(clave)) return msg('La contraseña debe tener 12+ caracteres con mayúscula, minúscula y número.');
+    const ok = await ejecutar({ accion: 'crear', email, nombre: String(f.get('nombre')).trim(), rol: f.get('rol'), password: clave }, `✓ Usuario ${email} creado como ${ROLES[f.get('rol')]}. Ya puede entrar con su contraseña temporal.`, e.target.querySelector('button.primary'));
+    if (ok) e.target.reset();
   });
-  const cambiar = async (email, cambios) => {
-    const { error } = await SB.from('tablero_accesos').update(cambios).eq('email', email);
-    if (error) alert('No se pudo actualizar: ' + error.message);
+  $('#accTabla').addEventListener('change', async (e) => {
+    const s = e.target.closest('[data-accrol]'); if (!s) return;
+    const { error } = await SB.from('tablero_accesos').update({ rol: s.value }).eq('email', s.dataset.accrol);
+    if (error) msg('No se pudo cambiar el rol: ' + error.message); else msg(`✓ Rol de ${s.dataset.accrol} cambiado a ${ROLES[s.value]}.`, true);
     await cargar();
-  };
-  $('#accTabla').addEventListener('change', (e) => { const s = e.target.closest('[data-accrol]'); if (s) cambiar(s.dataset.accrol, { rol: s.value }); });
+  });
   $('#accTabla').addEventListener('click', async (e) => {
-    const a = e.target.closest('[data-accact]');
-    if (a) return cambiar(a.dataset.accact, { activo: a.dataset.v === '1' });
-    const d = e.target.closest('[data-accdel]');
-    if (d && confirm(`¿Eliminar el acceso de ${d.dataset.accdel}?`)) {
-      const { error } = await SB.from('tablero_accesos').delete().eq('email', d.dataset.accdel);
-      if (error) alert('No se pudo eliminar: ' + error.message);
-      await cargar();
-    }
+    const b = e.target.closest('[data-acc]'); if (!b) return;
+    const { acc, email } = b.dataset;
+    if (acc === 'bloquear' && confirm(`¿Bloquear a ${email}? Perderá el acceso de inmediato.`)) await ejecutar({ accion: 'bloquear', email }, `✓ ${email} bloqueado.`, b);
+    if (acc === 'desbloquear') await ejecutar({ accion: 'desbloquear', email }, `✓ ${email} desbloqueado.`, b);
+    if (acc === 'password') { const c = await dialogoClave(email, false); if (c) await ejecutar({ accion: 'password', email, password: c }, `✓ Contraseña de ${email} actualizada.`, b); }
+    if (acc === 'crearcuenta') { const c = await dialogoClave(email, true); if (c) await ejecutar({ accion: 'crear', email, nombre: b.dataset.nombre, rol: b.dataset.rol, password: c }, `✓ Cuenta de ${email} creada.`, b); }
+    if (acc === 'eliminar' && confirm(`¿Eliminar a ${email}? Se borra su cuenta y su acceso. No se puede deshacer.`)) await ejecutar({ accion: 'eliminar', email }, `✓ ${email} eliminado.`, b);
   });
 };
 
@@ -816,7 +911,7 @@ function pantallaLogin(modo = 'entrar', msg = '') {
     else r = await SB.auth.updateUser({ password: clave });
     $('#lBtn').disabled = false;
     if (r.error) {
-      const t = /invalid login/i.test(r.error.message) ? 'Correo o contraseña incorrectos.' : /not confirmed/i.test(r.error.message) ? 'Primero confirma tu correo con el enlace que te enviamos.' : r.error.message;
+      const t = /invalid login/i.test(r.error.message) ? 'Correo o contraseña incorrectos.' : /not confirmed/i.test(r.error.message) ? 'Primero confirma tu correo con el enlace que te enviamos.' : /banned/i.test(r.error.message) ? 'Tu acceso está bloqueado. Contacta al administrador del tablero.' : r.error.message;
       return m(t);
     }
     if (modo === 'activar') return pantallaLogin('entrar', '✓ Revisa tu correo y confirma la cuenta; después inicia sesión.');
