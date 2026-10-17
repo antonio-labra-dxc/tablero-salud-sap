@@ -98,7 +98,9 @@ function sistema(sid, mes = estado.mes) {
   s.principal = app || null;
   s.producto = (app && app.producto) || primero(hosts, 'producto') || '';
   s.version = primero(hosts, 'versionProducto');
-  s.ambiente = primero(hosts, 'ambiente') || (app && app.estado) || null;
+  const AMB = { productive: 'Productivo', 'not productive': 'No productivo', test: 'Pruebas', development: 'Desarrollo' };
+  const amb = primero(hosts, 'ambiente') || (app && app.estado) || null;
+  s.ambiente = amb ? AMB[String(amb).toLowerCase()] || amb : null;
   s.kpis = Object.assign({}, ...delMes.filter((r) => r.kpis).map((r) => r.kpis).reverse());
   return s;
 }
@@ -124,7 +126,7 @@ function tabla(id, cols, filas, opts = {}) {
     if (g) fs.sort((a, b) => { const x = g(a), y = g(b); if (x == null) return 1; if (y == null) return -1; return (typeof x === 'number' && typeof y === 'number' ? x - y : String(x).localeCompare(String(y), 'es', { numeric: true })) * st0.dir; });
   }
   const head = cols.map((c) => `<th data-t="${id}" data-k="${c.k}" style="${c.num ? 'text-align:right;' : ''}${c.w ? 'min-width:' + c.w + 'px' : ''}">${esc(c.t)}${st0.orden === c.k ? (st0.dir > 0 ? ' ▲' : ' ▼') : ''}</th>`).join('');
-  const body = fs.length ? fs.map((f) => `<tr>${cols.map((c) => `<td class="${c.num ? 'num' : ''}">${c.html ? c.html(f) : fmt(f[c.k])}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${cols.length}" class="muted" style="text-align:center;padding:24px">Sin registros</td></tr>`;
+  const body = fs.length ? fs.map((f) => `<tr ${opts.fila ? opts.fila(f) : ''}>${cols.map((c) => `<td class="${c.num ? 'num' : ''}">${c.html ? c.html(f) : fmt(f[c.k])}</td>`).join('')}</tr>`).join('') : `<tr><td colspan="${cols.length}" class="muted" style="text-align:center;padding:24px">Sin registros</td></tr>`;
   return `<div class="tbl-wrap" id="tw-${id}"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 const TABLAS = {};
@@ -139,6 +141,7 @@ function csv(id, nombre) {
   a.click(); setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 const linkSid = (sid) => `<a href="#/sistema/${encodeURIComponent(sid)}"><b>${esc(sid)}</b></a>`;
+const fHora = (t) => (t ? new Date(t).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' }) : '—');
 // En la versión web los EWAs originales no están publicados: solo se muestra el nombre del archivo.
 const linkArchivo = (r) => !WEB && r.ruta && !/^[a-z][a-z0-9+.-]*:/i.test(r.ruta) ? `<a href="${esc(r.ruta.replace(/\\/g, '/'))}" target="_blank" rel="noopener" title="Abrir el EWA original">${esc(r.archivo)}</a>` : esc(r.archivo);
 
@@ -205,6 +208,7 @@ function editarSeg(sid, texto) {
     const { data, error } = await SB.from('tablero_seguimiento').upsert(fila, { onConflict: 'sid,hallazgo' }).select().single();
     if (error) { $('#segMsg').textContent = 'No se pudo guardar: ' + error.message; $('#segGuardar').disabled = false; return; }
     SEG.set(sid + '|' + texto, data);
+    CACHE = {};
     dlg.close();
     const y = window.scrollY; render(); window.scrollTo(0, y);
   });
@@ -214,284 +218,394 @@ function traduccionDe(texto) {
   return texto;
 }
 
+// ------------------------------------------------------------------ puntaje de atención (0–100)
+// Calificación (rojo 40 · amarillo 20 · sin calificación 10) + hallazgos prioritarios abiertos (6 c/u, máx 30)
+// + otros hallazgos abiertos (1 c/u, máx 10) + peor fin de soporte estándar (vencido 20 · ≤6 m 12 · 6–18 m 5).
+const PESO_CAL = { rojo: 40, amarillo: 20, 'sin-datos': 10, desconocido: 10, verde: 0 };
+const grupoCal = (c) => (['rojo', 'amarillo', 'verde'].includes(c) ? c : 'sin-datos');
+const abiertas = (s) => s.alertas.filter((a) => !['resuelto', 'aceptado'].includes(estadoSeg(s.sid, a.texto)));
+function soportePeor(sid) {
+  const e = eolDe(sid).filter((x) => x.tipo !== 'Extendido');
+  return e.sort((a, b) => a.est.m - b.est.m)[0] || null;
+}
+function puntaje(s) {
+  if (s._p) return s._p;
+  const ab = abiertas(s), pr = ab.filter((a) => a.prioritaria).length, ot = ab.length - pr, sp = soportePeor(s.sid);
+  const partes = [
+    ['Calificación', PESO_CAL[s.calif] ?? 10],
+    ['Hallazgos prioritarios', Math.min(30, pr * 6)],
+    ['Otros hallazgos', Math.min(10, ot)],
+    ['Fin de soporte', !sp ? 0 : sp.est.m < 0 ? 20 : sp.est.m <= 6 ? 12 : sp.est.m <= 18 ? 5 : 0],
+  ];
+  return (s._p = { total: Math.min(100, partes.reduce((a, [, n]) => a + n, 0)), partes, pr, ot, sp });
+}
+const nivel = (n) => (n >= 60 ? ['rojo', 'Alta'] : n >= 35 ? ['amarillo', 'Media'] : ['verde', 'Baja']);
+const METODO = 'Puntaje de atención (0–100) = calificación EWA (crítico 40 · advertencia 20 · sin calificación 10) + hallazgos prioritarios abiertos (6 c/u, máx. 30) + otros hallazgos abiertos (1 c/u, máx. 10) + peor fin de soporte estándar (vencido 20 · ≤ 6 meses 12 · 6–18 meses 5). Los hallazgos marcados como resueltos o riesgo aceptado no suman.';
+
+// ------------------------------------------------------------------ piezas visuales
+const cnt = (n, dec = 0) => `<span data-cnt="${n}" data-dec="${dec}">0</span>`;
+function anillo(n, grande) {
+  const sz = grande ? 88 : 46, r = grande ? 38 : 19, c = 2 * Math.PI * r, [cl, t] = nivel(n);
+  return `<div class="anillo ${grande ? 'g' : ''}" data-tip="Puntaje de atención ${n}/100 · prioridad ${t.toLowerCase()}"><svg viewBox="0 0 ${sz} ${sz}"><circle cx="${sz / 2}" cy="${sz / 2}" r="${r}" stroke="var(--surface-3)"/><circle class="v" cx="${sz / 2}" cy="${sz / 2}" r="${r}" stroke="${COLOR[cl]}" stroke-linecap="round" stroke-dasharray="0 ${c}" data-dash="${(c * n) / 100} ${c}"/></svg><b>${cnt(n)}</b></div>`;
+}
+function dona(segs, centro, etiqueta) {
+  const r = 70, c = 2 * Math.PI * r, tot = segs.reduce((a, s) => a + s.n, 0) || 1, vis = segs.filter((s) => s.n);
+  let off = 0;
+  const arcos = vis.map((s) => {
+    const len = (c * s.n) / tot, gap = vis.length > 1 ? 4 : 0;
+    const el = `<circle class="seg" cx="88" cy="88" r="${r}" stroke="${s.color}" stroke-dasharray="0 ${c}" data-dash="${Math.max(0, len - gap)} ${c}" stroke-dashoffset="${-off}" data-tip="${esc(s.t)}: ${s.n} sistemas"/>`;
+    off += len; return el;
+  }).join('');
+  return `<div class="dona"><svg viewBox="0 0 176 176"><circle cx="88" cy="88" r="${r}" stroke="var(--surface-3)"/>${arcos}</svg><div class="centro"><b>${cnt(centro)}</b><span>${esc(etiqueta)}</span></div></div>`;
+}
+const chipSid = (sid, extra = '') => { const s = sis(sid); return `<button type="button" class="chip" data-drawer="${esc(sid)}" data-tip="${esc(sid + ' · ' + (ETQ[s.calif] || 'Sin calificación') + (s.producto ? '\n' + s.producto : ''))}"><span class="d ${grupoCal(s.calif)}"></span>${esc(sid)}${extra}</button>`; };
+const etqSoporte = (sp) => (!sp ? '—' : sp.est.m < 0 ? 'Vencido' : sp.est.m <= 6 ? '≤ 6 m' : sp.est.m <= 18 ? '6–18 m' : '> 18 m');
+const qLink = (q, cambios) => { const p = new URLSearchParams(q); for (const [k, v] of Object.entries(cambios)) (v == null || v === '' ? p.delete(k) : p.set(k, v)); return p.toString(); };
+const segm = (q, k, opciones) => `<div class="segm">${opciones.map(([v, t, n]) => `<button type="button" class="${(q.get(k) || '') === v ? 'on' : ''}" data-qk="${k}" data-qv="${esc(v)}">${esc(t)}${n != null ? ` <b>${n}</b>` : ''}</button>`).join('')}</div>`;
+const valorSrc = (v, src) => (v == null ? '<span class="muted">—</span>' : `${esc(v)} ${src ? `<span class="src">${esc(src)}</span>` : ''}`);
+
+// indicadores combinados (EWA si existe; si no, inventario) — una sola fuente por valor
+const IND = [
+  ['disponibilidad', 'Disponibilidad semanal', 'dispSemanal', pct, (n) => n < 99],
+  ['respDialogo', 'Resp. promedio diálogo', 'respDialogo', null, (n) => n > 1000],
+  ['respRFC', 'Resp. promedio RFC', 'respRFC', null, (n) => n > 1000],
+  ['cpuApp', 'CPU máx. servidor App', 'maxCpu', pct, (n) => n > 70],
+  ['cpuBD', 'CPU máx. servidor BD', null, null, (n) => n > 70],
+  ['tamanoBD', 'Tamaño de BD', 'tamanoBD', null, null],
+  ['crecimientoBD', 'Crecimiento BD (mes)', 'crecimientoBD', null, null],
+  ['usuariosActivos', 'Usuarios activos', 'usuariosActivos', null, null],
+  ['respPicoDialogo', 'Diálogo en hora pico', null, null, (n) => n > 1000],
+  ['respPicoRFC', 'RFC en hora pico', null, null, (n) => n > 1000],
+  ['bdDialogo', 'Tiempo BD en diálogo', null, null, null],
+  ['bdRFC', 'Tiempo BD en RFC', null, null, null],
+  ['bdUpdate', 'Tiempo BD en update', null, null, null],
+  ['pasosDialogoHora', 'Pasos diálogo/hora máx.', null, null, null],
+  ['rfcHora', 'RFC/hora máx.', null, null, null],
+  ['usuariosFiori', 'Usuarios Fiori', null, null, null],
+  ['respHTTP', 'Resp. promedio HTTP', 'respHTTP', null, (n) => n > 1000],
+  ['usuariosTotales', 'Usuarios totales', 'usuariosTotales', null, null],
+  ['dumps', 'Dumps', 'dumpsSemana', null, null],
+];
+const CLAVE = ['disponibilidad', 'respDialogo', 'cpuApp', 'tamanoBD'];
+function indicador(s, k) {
+  const d = IND.find((x) => x[0] === k); if (!d) return { v: null };
+  const e = val(s.kpis[k]); if (e != null) return { v: e, src: 'EWA', n: num(e), d };
+  if (d[2]) { let i = val(primero(s.hosts, d[2])); if (i == null && k === 'dumps') i = val(primero(s.hosts, 'dumpsMes')); if (i != null) { if (d[3]) i = d[3](i); return { v: i, src: 'Inventario', n: num(i), d }; } }
+  return { v: null, d };
+}
+const alto = (x) => x.v != null && x.d && x.d[4] && x.n != null && x.d[4](x.n);
+
 // ------------------------------------------------------------------ vistas
 const VISTAS = {};
 
-VISTAS.resumen = (_, q) => {
+VISTAS.panorama = () => {
   const lista = SIDS.map(sis);
-  const conEwa = lista.filter((s) => s.reportes.length);
-  const cuenta = (c) => lista.filter((s) => (c === 'sin-datos' ? ['sin-datos', 'desconocido', null].includes(s.calif) : s.calif === c)).length;
-  const dist = ['rojo', 'amarillo', 'verde', 'sin-datos'].map((c) => ({ c, n: cuenta(c) }));
-  const totalAl = lista.reduce((a, s) => a + s.alertas.length, 0);
-  const totalPr = lista.reduce((a, s) => a + s.prioritarias, 0);
-  const ewasMes = reportes.filter((r) => r.mes === estado.mes).length;
-  if (!SIDS.length) return `<div class="pagehead"><div><div class="eyebrow">Resumen ejecutivo</div><h1>Aún no hay datos publicados</h1>
-    <p class="sub">${puedeEditar() ? 'Publica el archivo <span class="mono">datos/datos.json</span> generado en tu equipo desde <a href="#/publicar">Publicar datos</a>.' : 'El administrador todavía no ha publicado información.'}</p></div></div>`;
-  const cerrados = WEB ? lista.reduce((a, s) => a + s.alertas.filter((x) => ['resuelto', 'aceptado'].includes(estadoSeg(s.sid, x.texto))).length, 0) : 0;
-  const enAtencion = WEB ? lista.reduce((a, s) => a + s.alertas.filter((x) => estadoSeg(s.sid, x.texto) === 'en_atencion').length, 0) : 0;
-
-  // hallazgos por categoría (# sistemas afectados)
-  const porCat = CATS.map((c) => ({ t: c, n: lista.filter((s) => s.alertas.some((a) => a.categoria === c)).length, h: lista.reduce((a, s) => a + s.alertas.filter((x) => x.categoria === c).length, 0) }))
-    .map((x) => ({ ...x, tip: `${x.t}: ${x.n} sistemas · ${x.h} hallazgos`, href: '#/hallazgos?cat=' + encodeURIComponent(x.t) }))
-    .sort((a, b) => b.n - a.n);
-  // hallazgos más recurrentes
-  const rec = {};
-  for (const s of lista) for (const a of s.alertas) { const k = a.es || a.generico; (rec[k] ||= new Set()).add(s.sid); }
-  const top = Object.entries(rec).map(([t, set]) => ({ t, n: set.size, tip: `${t}\nSistemas: ${[...set].join(', ')}` })).sort((a, b) => b.n - a.n).slice(0, 10);
-
-  // mapa de salud por familia
-  const fams = {};
-  for (const s of lista) (fams[s.familia] ||= []).push(s);
-  const famOrden = Object.entries(fams).sort((a, b) => Math.max(...b[1].map((s) => ORDEN[s.calif] || 0)) - Math.max(...a[1].map((s) => ORDEN[s.calif] || 0)) || a[0].localeCompare(b[0]));
-  const tile = (s) => `<a class="tile ${s.calif || ''}" href="#/sistema/${encodeURIComponent(s.sid)}" data-tip="${esc(`${s.sid} · ${ETQ[s.calif] || 'Sin calificación'}${s.fuenteCalif ? ' (' + s.fuenteCalif + ')' : ''}\n${s.producto || ''}\n${s.reportes.length ? plural(s.alertas.length, 'hallazgo') + ' · ' + s.prioritarias + ' prioritarios' : 'Sin EWA en el periodo'}${s.hosts.length ? '\n' + plural(s.hosts.length, 'host') + ' en inventario' : ''}`)}">
-      <div class="sid">${esc(s.sid)} ${st(s.calif, ' ')}</div>
-      <div class="p">${esc(s.producto || 'Producto no identificado')}</div>
-      <div class="m"><span>${s.reportes.length ? plural(s.alertas.length, 'hallazgo') : '<span class="muted">sin EWA</span>'}</span>${s.prioritarias ? `<span style="color:var(--crit)">${s.prioritarias}!</span>` : ''}</div></a>`;
-  const agrupar = q.get('g') === 'landscape' ? 'landscape' : 'estado';
-  const grupos = agrupar === 'estado'
-    ? ['rojo', 'amarillo', 'sin-datos', 'verde'].map((c) => [ETQ[c], lista.filter((s) => (c === 'sin-datos' ? ['sin-datos', 'desconocido', null, undefined].includes(s.calif) : s.calif === c)).sort((a, b) => b.alertas.length - a.alertas.length || a.sid.localeCompare(b.sid)), c]).filter((g) => g[1].length)
-    : famOrden.map(([f, ss]) => [nombreFam(f) || 'Familia ' + f + '*', ss.sort((a, b) => (ORDEN[b.calif] || 0) - (ORDEN[a.calif] || 0) || a.sid.localeCompare(b.sid)), null]);
-
-  // matriz SID x categoría
-  const matriz = conEwa.filter((s) => s.alertas.length).sort((a, b) => b.alertas.length - a.alertas.length);
-  const maxCel = Math.max(1, ...matriz.flatMap((s) => CATS.map((c) => s.alertas.filter((a) => a.categoria === c).length)));
-  const celda = (n) => n ? `<td class="c" style="background:color-mix(in oklab,var(--brand) ${Math.round(18 + (n / maxCel) * 72)}%,var(--surface-2))" data-tip="${n} hallazgos">${n}</td>` : '<td class="c muted" style="background:var(--surface-2)">·</td>';
-
-  // ciclo de vida próximo
-  const eol = SIDS.flatMap(eolDe).filter((e) => e.est && e.est.m <= 18 && e.tipo !== 'Extendido');
-
-  return `
-  <div class="pagehead"><div><div class="eyebrow">Resumen ejecutivo · ${esc(fMes(estado.mes))}</div><h1>Estado de salud del landscape SAP</h1>
-  <p class="sub">${SIDS.length} sistemas · ${ewasMes} EarlyWatch Alerts procesados del periodo · inventario ${esc(inv.archivo || '—')}</p></div>
-  <div class="ctl"><button class="btn" data-print>Imprimir / PDF</button></div></div>
-
-  <div class="grid g-kpi">
-    ${kpi('Sistemas monitoreados', SIDS.length, `${conEwa.length} con EWA · ${SIDS.length - conEwa.length} solo inventario`)}
-    ${kpi('Críticos', `<span style="color:var(--crit)">${dist[0].n}</span>`, 'Calificación roja')}
-    ${kpi('En advertencia', `<span style="color:var(--warn)">${dist[1].n}</span>`, 'Calificación amarilla')}
-    ${kpi('Saludables', `<span style="color:var(--good)">${dist[2].n}</span>`, `${dist[3].n} sin calificación`)}
-    ${WEB ? kpi('Hallazgos abiertos', totalAl - cerrados, `${enAtencion} en atención · ${cerrados} resueltos o aceptados · ${totalPr} prioritarios`)
-      : kpi('Hallazgos del EWA', totalAl, `${totalPr} de atención prioritaria`)}
-    ${kpi('Hosts inventariados', inv.hosts.length, `${(inv.infra || []).length} activos de infraestructura`)}
-  </div>
-
-  <div class="card section">
-    <div class="card-h"><h2>Distribución de calificación</h2><span class="muted">EWA del mes; si el sistema no tiene EWA se usa la calificación del inventario</span></div>
-    <div class="stack" role="img" aria-label="Distribución de calificaciones">${dist.filter((d) => d.n).map((d) => `<span style="width:${(d.n / SIDS.length) * 100}%;background:${COLOR[d.c]}" data-tip="${ETQ[d.c]}: ${d.n} sistemas"></span>`).join('')}</div>
-    <div class="legend">${dist.map((d) => `${st(d.c)} <span class="muted small">${d.n} (${Math.round((d.n / SIDS.length) * 100)}%)</span>`).join('&nbsp;&nbsp;')}</div>
-  </div>
-
-  <div class="card section">
-    <div class="card-h"><h2>Mapa de salud</h2><span class="toolbar" style="margin:0">
-      <a class="btn ${agrupar === 'estado' ? 'primary' : ''}" href="#/resumen?g=estado" style="display:inline-flex;align-items:center;color:inherit;text-decoration:none;height:30px">Por estado</a>
-      <a class="btn ${agrupar === 'landscape' ? 'primary' : ''}" href="#/resumen?g=landscape" style="display:inline-flex;align-items:center;color:inherit;text-decoration:none;height:30px">Por landscape</a></span></div>
-    <div class="${agrupar === 'landscape' ? 'fams' : ''}">${grupos.map(([t, ss, c]) => `<div class="${agrupar === 'landscape' ? 'fam' : 'grupo'}"><div class="fam-h"><b>${c ? st(c, t) : esc(t)}</b><span class="muted small">${plural(ss.length, 'sistema')}</span></div>
-      <div class="tiles">${ss.map(tile).join('')}</div></div>`).join('')}</div>
-    <p class="muted small" style="margin:12px 0 0">Clic en un sistema para ver su detalle. ${agrupar === 'landscape' ? '* Agrupación automática por las dos primeras letras del SID; se ajusta en <span class="mono">motor/config.json</span>.' : 'Calificación del EWA del mes; si no hay EWA, la del inventario.'}</p>
-  </div>
-
-  <div class="grid g-2 section">
-    <div class="card"><div class="card-h"><h2>Sistemas afectados por categoría</h2><span class="muted">sistemas con ≥1 hallazgo</span></div>${bars(porCat, conEwa.length)}</div>
-    <div class="card"><div class="card-h"><h2>Hallazgos más recurrentes</h2><span class="muted">número de sistemas</span></div>${bars(top)}</div>
-  </div>
-
-  <div class="card section">
-    <div class="card-h"><h2>Concentración de hallazgos</h2><span class="muted">sistema × categoría · más oscuro = más hallazgos</span></div>
-    ${matriz.length ? `<div style="overflow:auto"><table class="heat"><thead><tr><th></th>${CATS.map((c) => `<th>${esc(c)}</th>`).join('')}<th>Total</th></tr></thead><tbody>
-      ${matriz.map((s) => `<tr><td class="s">${linkSid(s.sid)} ${st(s.calif, ' ')}</td>${CATS.map((c) => celda(s.alertas.filter((a) => a.categoria === c).length)).join('')}<td class="c">${s.alertas.length}</td></tr>`).join('')}
-    </tbody></table></div>` : '<div class="empty">Sin hallazgos en el periodo</div>'}
-  </div>
-
-  <div class="card section">
-    <div class="card-h"><h2>Fin de soporte en los próximos 18 meses</h2><a href="#/ciclo">Ver ciclo de vida completo →</a></div>
-    ${eol.length ? tabla('eolTop', [
-      { k: 'sid', t: 'SID', html: (e) => linkSid(e.sid) }, { k: 'componente', t: 'Componente' }, { k: 'ref', t: 'Referencia' },
-      { k: 'tipo', t: 'Soporte' }, { k: 'fecha', t: 'Fecha', html: (e) => fFecha(e.fecha) }, { k: 'est', t: 'Estado', html: (e) => st(e.est.c, e.est.t), sort: (e) => e.est.m }, { k: 'fuente', t: 'Fuente' },
-    ], eol, { orden: 'fecha' }) : '<div class="empty">Sin vencimientos próximos registrados</div>'}
-  </div>`;
-};
-
-VISTAS.sistema = (sid) => {
-  sid = (sid || '').toUpperCase();
-  if (!sid || !SIDS.includes(sid)) {
-    return `<div class="pagehead"><div><div class="eyebrow">Sistema</div><h1>Selecciona un sistema</h1><p class="sub">Escribe el SID en el buscador superior o elige uno de la lista.</p></div></div>
-      <div class="card"><div class="tiles">${SIDS.map((x) => sis(x)).map((s) => `<a class="tile ${s.calif || ''}" href="#/sistema/${encodeURIComponent(s.sid)}"><div class="sid">${esc(s.sid)} ${st(s.calif, ' ')}</div><div class="p">${esc(s.producto)}</div></a>`).join('')}</div></div>`;
-  }
-  const s = sis(sid);
-  const k = s.kpis, h0 = s.hosts[0] || {};
-  const rel = SIDS.filter((x) => x !== sid && familiaDe(x) === s.familia);
-  const fuente = (ewa, invv) => (ewa != null ? 'EWA' : invv != null ? 'Inventario' : null);
-  const kv = (ewaKey, invKey, transf = (x) => x) => { const e = val(k[ewaKey]); const i = invKey ? val(primero(s.hosts, invKey)) : null; return { v: e ?? (i != null ? transf(i) : null), src: fuente(e, i) }; };
-  const disp = kv('disponibilidad', 'dispSemanal', pct), rd = kv('respDialogo', 'respDialogo'), rr = kv('respRFC', 'respRFC'),
-    cpu = kv('cpuApp', 'maxCpu', pct), cpub = kv('cpuBD', null), tbd = kv('tamanoBD', 'tamanoBD'), cbd = kv('crecimientoBD', 'crecimientoBD'),
-    ua = kv('usuariosActivos', 'usuariosActivos');
-  const ut = val(primero(s.hosts, 'usuariosTotales')), dumps = val(primero(s.hosts, 'dumpsSemana')) ?? val(primero(s.hosts, 'dumpsMes'));
-  const resp = val(primero(s.hosts, 'respHTTP'));
-  const eol = eolDe(sid);
-  const porCat = CATS.map((c) => ({ c, a: s.alertas.filter((x) => x.categoria === c) })).filter((x) => x.a.length);
-  const hist = {};
-  for (const r of s.historia) (hist[r.mes] ||= []).push(r);
-  const mesesSid = Object.keys(hist).sort().reverse();
-  const areas = {};
-  for (const r of s.reportes) for (const a of r.areas || []) { const t = a.tema.replace(new RegExp(`\\b${sid}\\b`, 'g'), '').trim(); (areas[t] ||= new Set()); for (const x of a.sub) areas[t].add(x); }
-
+  if (!lista.length) return `<div class="pagehead"><div><div class="eyebrow">Panorama</div><h1>Aún no hay datos publicados</h1>
+    <p class="sub">${puedeEditar() ? 'Publica el archivo <span class="mono">datos/datos.json</span> desde <a href="#/publicar">Publicar datos</a>.' : 'El administrador todavía no ha publicado información.'}</p></div></div>`;
+  const dist = [['rojo', 'Crítico'], ['amarillo', 'Advertencia'], ['verde', 'Saludable'], ['sin-datos', 'Sin calificación']].map(([c, t]) => ({ c, t, n: lista.filter((s) => grupoCal(s.calif) === c).length, color: COLOR[c] }));
+  const conEwa = lista.filter((s) => s.reportes.length).length;
+  const ab = lista.flatMap((s) => abiertas(s).map((a) => ({ s, a })));
+  const prio = ab.filter((x) => x.a.prioritaria), sisPrio = new Set(prio.map((x) => x.s.sid)).size;
+  const temas = CATS.map((c) => {
+    const it = ab.filter((x) => x.a.categoria === c), por = {};
+    for (const x of it) (por[x.a.es || x.a.generico] ||= new Set()).add(x.s.sid);
+    const top = Object.entries(por).sort((a, b) => b[1].size - a[1].size)[0];
+    return { c, n: new Set(it.map((x) => x.s.sid)).size, h: it.length, top: top && top[0], topN: top && top[1].size };
+  }).filter((t) => t.n).sort((a, b) => b.n - a.n);
+  const maxT = Math.max(1, ...temas.map((t) => t.n));
+  const eol = SIDS.flatMap(eolDe).filter((e) => e.tipo !== 'Extendido' && e.est.m <= 6), eolSids = new Set(eol.map((e) => e.sid)).size;
+  const rank = lista.map((s) => ({ s, p: puntaje(s) })).sort((a, b) => b.p.total - a.p.total || a.s.sid.localeCompare(b.s.sid));
+  const altaN = rank.filter((x) => x.p.total >= 60).length;
+  const resueltos = WEB ? lista.reduce((a, s) => a + s.alertas.length - abiertas(s).length, 0) : 0;
+  const crit = dist[0].n, dom = temas[0];
+  const pub = D.publicacion;
   return `
   <div class="card hero">
     <div>
-      <div class="eyebrow">Sistema · ${esc(fMes(estado.mes))}</div>
-      <div class="sidbig" style="margin-top:6px">${esc(sid)}</div>
-      <div style="margin-top:6px;font-size:15px">${esc(s.producto || 'Producto no identificado')} ${s.version ? `<span class="muted">· ${esc(s.version)}</span>` : ''}</div>
-      <div class="meta">
-        <div><span>Ambiente</span><b>${fmt(s.ambiente)}</b></div>
-        <div><span>Despliegue</span><b>${fmt(primero(s.hosts, 'despliegue'))}</b></div>
-        <div><span>NetWeaver / Kernel</span><b>${fmt([val(primero(s.hosts, 'versionNW')), val(primero(s.hosts, 'kernel'))].filter(Boolean).join(' · '))}</b></div>
-        <div><span>Base de datos</span><b>${fmt(val(primero(s.hosts, 'bd')) || (s.principal && s.principal.baseDatos))}</b></div>
-        <div><span>Sistema operativo</span><b>${fmt(val(primero(s.hosts, 'osVersion')) || val(primero(s.hosts, 'so')) || (s.reportes.flatMap((r) => r.so || [])[0]))}</b></div>
-        <div><span>Periodo EWA</span><b>${s.principal ? `${fFecha(s.principal.desde)} – ${fFecha(s.principal.hasta)}` : '<span class="muted">Sin EWA este mes</span>'}</b></div>
-        <div><span>Servidores App / BD</span><b>${fmt([val(primero(s.hosts, 'servidoresApp')), val(primero(s.hosts, 'servidoresBD'))].filter((x) => x != null).join(' / '))}</b></div>
-        <div><span>Landscape</span><b>${esc(nombreFam(s.familia) || 'Familia ' + s.familia)}</b></div>
-      </div>
-      ${rel.length ? `<div style="margin-top:14px"><span class="muted small">Sistemas relacionados: </span>${rel.map((x) => `<a class="chip" href="#/sistema/${encodeURIComponent(x)}">${esc(x)} <span class="st ${sis(x).calif || ''}" style="font-size:10px"><i style="width:7px;height:7px"></i></span></a>`).join('')}</div>` : ''}
+      <div class="eyebrow">Estado del landscape · EWA ${esc(fMes(estado.mes))}</div>
+      <h1>${crit ? `<span class="crit">${crit} ${crit === 1 ? 'sistema crítico' : 'sistemas críticos'}</span> y ` : ''}<em>${prio.length} hallazgos de atención prioritaria</em> en ${sisPrio} sistemas.${dom ? ` El riesgo dominante es <em>${esc(dom.c.toLowerCase())}</em>, presente en ${dom.n} sistemas.` : ''}</h1>
+      <div class="hero-meta"><span><b>${SIDS.length}</b> sistemas monitoreados</span><span><b>${reportes.filter((r) => r.mes === estado.mes).length}</b> EarlyWatch Alerts del periodo</span><span><b>${inv.hosts.length}</b> servidores inventariados</span>${pub ? `<span>Publicado por <b>${esc(pub.publicado_por)}</b> · ${esc(fHora(pub.publicado_en))}</span>` : ''}</div>
     </div>
-    <div class="badge-big">
-      ${st(s.calif, ETQ[s.calif] || 'Sin calificación')}
-      <span class="muted small">${s.fuenteCalif ? 'Fuente: ' + s.fuenteCalif : 'Sin calificación disponible'}</span>
-      <span class="pill">${s.alertas.length} hallazgos</span>
-      ${s.prioritarias ? `<span class="pill prio">${s.prioritarias} prioritarios</span>` : ''}
+    <div style="display:flex;gap:22px;align-items:center;flex-wrap:wrap">
+      ${dona(dist, SIDS.length, 'sistemas')}
+      <div class="leyenda">${dist.map((d) => `<div class="lnk" data-href="#/sistemas?est=${d.c}">${st(d.c, d.t)}<b>${cnt(d.n)}</b></div>`).join('')}</div>
     </div>
   </div>
-
-  ${!s.reportes.length ? `<div class="note section">No hay EarlyWatch Alert de <b>${esc(sid)}</b> en ${esc(fMes(estado.mes))}. Se muestra la información del inventario. Agrega el EWA en la carpeta <span class="mono">EWAs\\</span> y ejecuta <b>Actualizar tablero.cmd</b>.</div>` : ''}
 
   <div class="grid g-kpi section">
-    ${kpi('Disponibilidad semanal', fmt(disp.v), null, disp.src)}
-    ${kpi('Resp. promedio diálogo', fmt(rd.v), k.respPicoDialogo ? 'Hora pico: ' + esc(k.respPicoDialogo) : null, rd.src)}
-    ${kpi('Resp. promedio RFC', fmt(rr.v), k.respPicoRFC ? 'Hora pico: ' + esc(k.respPicoRFC) : null, rr.src)}
-    ${kpi('CPU máx. servidor App', fmt(cpu.v), cpub.v ? 'CPU máx. BD: ' + esc(cpub.v) : null, cpu.src)}
-    ${kpi('Tamaño de BD', fmt(tbd.v), cbd.v ? 'Crecimiento último mes: ' + esc(cbd.v) : null, tbd.src)}
-    ${kpi('Usuarios activos', fmt(ua.v), ut ? 'Usuarios totales: ' + esc(ut) : null, ua.src)}
-    ${resp ? kpi('Resp. promedio HTTP', fmt(resp), null, 'Inventario') : ''}
-    ${dumps != null ? kpi('Dumps', fmt(dumps), null, 'Inventario') : ''}
+    <div class="card kpi link" data-href="#/cobertura"><div class="lbl">Cobertura de EWA</div><div class="val">${cnt(Math.round((conEwa / SIDS.length) * 100))}<small>%</small></div><div class="foot">${conEwa} de ${SIDS.length} sistemas con EWA en el periodo</div><div class="prog"><span style="width:${(conEwa / SIDS.length) * 100}%"></span></div></div>
+    <div class="card kpi link" data-href="#/hallazgos?prio=si"><div class="lbl">Hallazgos prioritarios abiertos</div><div class="val" style="color:var(--crit)">${cnt(prio.length)}</div><div class="foot">en ${sisPrio} sistemas${WEB ? ` · ${resueltos} resueltos o aceptados` : ''}</div></div>
+    <div class="card kpi link" data-href="#/ciclo?e=riesgo"><div class="lbl">Soporte vencido o por vencer (≤ 6 meses)</div><div class="val" style="color:${eol.length ? 'var(--warn)' : 'var(--good)'}">${cnt(eol.length)}</div><div class="foot">componentes en ${eolSids} sistemas</div></div>
+    <div class="card kpi link" data-href="#/sistemas?orden=puntaje"><div class="lbl">Sistemas con prioridad alta</div><div class="val">${cnt(altaN)}</div><div class="foot">puntaje de atención ≥ 60 de 100</div></div>
   </div>
 
-  <div class="grid g-2 section">
-    <div class="card">
-      <div class="card-h"><h2>Hallazgos del EarlyWatch Alert</h2><span class="muted">${s.alertas.length} · ● rojo = atención prioritaria</span></div>
-      ${porCat.length ? porCat.map((g) => `<div class="cat-h"><b>${esc(g.c)}</b><span class="pill">${g.a.length}</span></div>
-        ${g.a.map((a) => `<div class="finding"><span class="dot ${a.prioritaria ? 'p' : ''}" title="${a.prioritaria ? 'Atención prioritaria' : 'Advertencia'}"></span><div>${esc(a.es || a.generico)}${a.objeto ? ` <span class="chip mono">${esc(a.objeto)}</span>` : ''}${a.es ? `<div class="en">${esc(a.generico)}</div>` : ''}${WEB ? `<div style="margin-top:6px">${chipSeg(sid, a)}</div>` : ''}</div></div>`).join('')}`).join('')
-        : `<div class="empty">${s.reportes.length ? 'El EWA no reporta hallazgos' : 'Sin EWA en el periodo'}</div>`}
+  <div class="grid g12 section">
+    <div class="card s7">
+      <div class="card-h"><h2>Dónde actuar primero</h2><a href="#/sistemas?orden=puntaje" class="small">Ver los ${SIDS.length} sistemas →</a></div>
+      <div class="rank">${rank.slice(0, 10).map((x, i) => `<div class="rank-row" data-drawer="${esc(x.s.sid)}">
+        <span class="pos">${String(i + 1).padStart(2, '0')}</span>
+        <div><div class="sid">${st(x.s.calif, ' ')}${esc(x.s.sid)}</div><div class="prod">${esc(x.s.producto || '—')}</div></div>
+        <div class="pila" data-tip="${esc(x.p.partes.map(([t, n]) => `${t}: ${n}`).join('\n'))}">${x.p.partes.map(([, n], j) => (n ? `<span class="p${j + 1}" style="width:${n}%;animation-delay:${i * 40}ms"></span>` : '')).join('')}</div>
+        <span class="score">${cnt(x.p.total)}</span></div>`).join('')}</div>
+      <div class="ley-pila">${['Calificación', 'Hallazgos prioritarios', 'Otros hallazgos', 'Fin de soporte'].map((t, j) => `<span><i class="p${j + 1}"></i>${t}</span>`).join('')}</div>
     </div>
-    <div class="card">
-      <div class="card-h"><h2>Ciclo de vida y soporte</h2><span class="muted">al ${fFecha(HOY.toISOString().slice(0, 10))}</span></div>
-      ${eol.length ? `<div class="tbl-wrap"><table><thead><tr><th>Componente</th><th>Soporte</th><th>Fecha</th><th>Estado</th></tr></thead><tbody>${eol.map((e) => `<tr><td>${esc(e.componente)}<div class="muted small">${esc(e.ref || '')}</div></td><td>${esc(e.tipo)} <span class="src">${esc(e.fuente)}</span></td><td class="num">${fFecha(e.fecha)}</td><td>${st(e.est.c, e.est.t)}</td></tr>`).join('')}</tbody></table></div>` : '<div class="empty">Sin fechas de fin de soporte registradas</div>'}
-      ${['mesesSinKernel', 'mesesSinComponentes', 'mesesSinBD'].some((x) => val(primero(s.hosts, x)) != null) ? `<div class="meta" style="margin-top:16px">
-        <div><span>Meses sin actualizar kernel</span><b>${fmt(primero(s.hosts, 'mesesSinKernel'))}</b></div>
-        <div><span>Meses sin actualizar componentes</span><b>${fmt(primero(s.hosts, 'mesesSinComponentes'))}</b></div>
-        <div><span>Meses sin actualizar BD</span><b>${fmt(primero(s.hosts, 'mesesSinBD'))}</b></div></div>` : ''}
+    <div class="card s5">
+      <div class="card-h"><h2>Riesgo por tema</h2><span class="muted">sistemas afectados</span></div>
+      ${temas.map((t, i) => `<div class="tema" data-href="#/hallazgos?cat=${encodeURIComponent(t.c)}" data-tip="${esc(`${t.c}: ${t.h} hallazgos abiertos en ${t.n} sistemas`)}">
+        <div><div class="t1">${esc(t.c)}</div><div class="t2">${t.top ? `Principal: ${esc(t.top)} (${t.topN})` : ''}</div></div>
+        <div class="barra"><span style="width:${(t.n / maxT) * 100}%;animation-delay:${i * 60}ms"></span></div><span class="n">${cnt(t.n)}</span></div>`).join('') || '<div class="empty">Sin hallazgos abiertos</div>'}
     </div>
   </div>
-
-  ${Object.keys(k).length ? `<div class="card section"><div class="card-h"><h2>Indicadores de rendimiento del EWA</h2><span class="muted">Performance Indicators</span></div>
-    <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px">${Object.entries(KPI_EWA).filter(([x]) => k[x]).map(([x, t]) => `<div style="background:var(--surface-2);border-radius:10px;padding:10px 12px"><div class="muted small">${esc(t)}</div><div style="font-size:18px;font-weight:650">${esc(k[x])}</div></div>`).join('')}</div></div>` : ''}
-
-  <div class="card section">
-    <div class="card-h"><h2>Reportes EWA del periodo</h2><span class="muted">un sistema puede tener EWA de aplicación y de base de datos HANA</span></div>
-    ${tabla('rep-' + sid, [
-      { k: 'tipo', t: 'Tipo' }, { k: 'producto', t: 'Producto' }, { k: 'baseDatos', t: 'Base de datos' },
-      { k: 'periodo', t: 'Periodo', html: (r) => `${fFecha(r.desde)} – ${fFecha(r.hasta)}`, sort: (r) => r.desde },
-      { k: 'calificacion', t: 'Calificación', html: (r) => st(r.calificacion), sort: (r) => -ORDEN[r.calificacion] },
-      { k: 'alertas', t: 'Hallazgos', num: true, html: (r) => r.alertas.length, sort: (r) => r.alertas.length },
-      { k: 'recomendaciones', t: 'Recomend.', num: true }, { k: 'sesion', t: 'Sesión', html: (r) => `<span class="mono">${fmt(r.sesion)}</span>` },
-      { k: 'archivo', t: 'Archivo', html: (r) => linkArchivo(r) + (r.duplicados ? `<div class="muted small">duplicados: ${esc(r.duplicados.join(', '))}</div>` : '') },
-    ], s.reportes)}
-  </div>
-
-  <div class="card section">
-    <div class="card-h"><h2>Servidores</h2><span class="muted">${s.hosts.length} en inventario${s.infra.length ? ' · ' + s.infra.length + ' en infraestructura' : ''}</span></div>
-    ${s.hosts.length ? tabla('hosts-' + sid, [
-      { k: 'hostname', t: 'Host', html: (h) => `<span class="mono">${fmt(h.hostname)}</span>${h.componente ? ` <span class="chip">${esc(h.componente)}</span>` : ''}` }, { k: 'ip', t: 'IP', html: (h) => `<span class="mono">${fmt(h.ip)}</span>` },
-      { k: 'ambiente', t: 'Ambiente' }, { k: 'cpu', t: 'CPU' }, { k: 'memoria', t: 'Memoria', html: (h) => fmt(memoria(h.memoria)) },
-      { k: 'osVersion', t: 'Sistema operativo', html: (h) => fmt(val(h.osVersion) || h.so) }, { k: 'hwTipo', t: 'Hardware', html: (h) => fmt(val(h.hwTipo) || h.hwDescripcion) },
-    ], s.hosts) : ''}
-    ${s.infra.length ? `<div style="margin-top:12px">${tabla('infra-' + sid, [{ k: 'hostname', t: 'Host (infraestructura)', html: (h) => `<span class="mono">${fmt(h.hostname)}</span>` }, { k: 'ip', t: 'IP' }, { k: 'tipo', t: 'Tipo' }, { k: 'so', t: 'SO' }, { k: 'ramMB', t: 'RAM', html: (h) => fmt(memoria(h.ramMB)) }, { k: 'ubicacion', t: 'Ubicación' }, { k: 'descripcion', t: 'Descripción' }], s.infra)}</div>` : ''}
-    ${s.reportes.some((r) => r.hosts && r.hosts.length) ? `<div style="margin-top:12px"><span class="muted small">Hosts detectados en el EWA: </span>${[...new Set(s.reportes.flatMap((r) => r.hosts || []))].map((x) => `<span class="chip mono">${esc(x)}</span>`).join('')}</div>` : ''}
-    ${!s.hosts.length && !s.infra.length && !s.reportes.some((r) => r.hosts && r.hosts.length) ? '<div class="empty">Sin servidores registrados</div>' : ''}
-  </div>
-
-  <div class="grid g-2 section">
-    <div class="card"><div class="card-h"><h2>Histórico mensual</h2><span class="muted">${mesesSid.length} ${mesesSid.length === 1 ? 'mes' : 'meses'}</span></div>
-      ${mesesSid.length ? `<div class="tbl-wrap"><table><thead><tr><th>Mes</th><th>Calificación</th><th style="text-align:right">Hallazgos</th><th style="text-align:right">Reportes</th></tr></thead><tbody>${mesesSid.map((m) => { const ss = sistema(sid, m); return `<tr><td>${esc(fMes(m))}</td><td>${st(ss.calif)}</td><td class="num">${ss.alertas.length}</td><td class="num">${hist[m].length}</td></tr>`; }).join('')}</tbody></table></div>
-      ${mesesSid.length === 1 ? '<p class="muted small" style="margin-top:10px">La tendencia aparecerá al cargar los EWAs de los siguientes meses.</p>' : ''}` : '<div class="empty">Aún sin EWAs para este sistema</div>'}
-    </div>
-    <div class="card"><div class="card-h"><h2>Áreas revisadas por el EWA</h2><span class="muted">Check Overview</span></div>
-      ${Object.keys(areas).length ? Object.entries(areas).map(([t, subs]) => `<div style="margin-bottom:10px"><b class="small">${esc(t)}</b><div>${[...subs].map((x) => `<span class="chip">${esc(x)}</span>`).join('')}</div></div>`).join('') : '<div class="empty">Sin detalle</div>'}
-    </div>
-  </div>
-  ${val(primero(s.hosts, 'comentarios')) ? `<div class="note section"><b>Comentarios del inventario:</b> ${esc(primero(s.hosts, 'comentarios'))}</div>` : ''}`;
+  <p class="metodo">${esc(METODO)}</p>`;
 };
 
-VISTAS.hallazgos = (_, q) => {
-  const filas = [];
-  for (const sid of SIDS) { const s = sis(sid); for (const a of s.alertas) filas.push({ sid, calif: s.calif, ...a }); }
-  const cat = q.get('cat') || '', pr = q.get('prio') || '', sg = q.get('seg') || '', txt = (q.get('q') || '').toLowerCase();
-  const f = filas.filter((x) => (!cat || x.categoria === cat) && (!pr || (pr === 'si') === x.prioritaria) && (!sg || estadoSeg(x.sid, x.texto) === sg)
-    && (!txt || (x.sid + ' ' + x.texto + ' ' + (x.es || '') + ' ' + ((segDe(x.sid, x.texto) || {}).responsable || '')).toLowerCase().includes(txt)));
-  const porCat = CATS.map((c) => ({ t: c, n: filas.filter((x) => x.categoria === c).length, href: '#/hallazgos?cat=' + encodeURIComponent(c) })).sort((a, b) => b.n - a.n);
-  return `<div class="pagehead"><div><div class="eyebrow">Hallazgos · ${esc(fMes(estado.mes))}</div><h1>Hallazgos de EarlyWatch Alert</h1><p class="sub">${filas.length} hallazgos en ${new Set(filas.map((x) => x.sid)).size} sistemas · ${filas.filter((x) => x.prioritaria).length} de atención prioritaria</p></div></div>
-  <div class="grid g-2"><div class="card"><div class="card-h"><h2>Por categoría</h2><span class="muted">clic para filtrar</span></div>${bars(porCat)}</div>
-  <div class="card"><div class="card-h"><h2>Cómo leer esta vista</h2></div><p class="muted" style="margin:0">Cada fila es un hallazgo del <i>Alert Overview</i> del EWA, traducido al español (el texto original de SAP se conserva). La <b>categoría</b> y la marca de <b>atención prioritaria</b> se asignan automáticamente por palabras clave (riesgo de seguridad, soporte vencido, autorizaciones críticas); no sustituyen la calificación de SAP.</p></div></div>
-  <div class="card section">
+VISTAS.sistemas = (_, q) => {
+  const todos = SIDS.map(sis);
+  const tipoDe = (s) => (s.reportes.length ? [...new Set(s.reportes.map((r) => (/HANA/.test(r.tipo) ? 'HANA' : /Java/.test(r.tipo) ? 'Java' : /ABAP/.test(r.tipo) ? 'ABAP' : /Business/.test(r.tipo) ? 'BODS' : 'Otro')))] : []);
+  const txt = (q.get('q') || '').toLowerCase(), est = q.get('est') || '', fuente = q.get('fuente') || '', vista = q.get('vista') || 'tarjetas', orden = q.get('orden') || 'puntaje';
+  const pasa = (s, sinEst) => (!txt || (s.sid + ' ' + s.producto + ' ' + s.hosts.map((h) => h.hostname).join(' ')).toLowerCase().includes(txt))
+    && (sinEst || !est || grupoCal(s.calif) === est) && (!fuente || (fuente === 'ewa' ? s.reportes.length : !s.reportes.length));
+  const base = todos.filter((s) => pasa(s, true));
+  const lista = base.filter((s) => pasa(s)).sort((a, b) => (orden === 'sid' ? a.sid.localeCompare(b.sid) : orden === 'hallazgos' ? abiertas(b).length - abiertas(a).length : puntaje(b).total - puntaje(a).total) || a.sid.localeCompare(b.sid));
+  const n = (c) => base.filter((s) => grupoCal(s.calif) === c).length;
+  const tarjeta = (s, i) => { const p = puntaje(s); return `<div class="tsis ${grupoCal(s.calif)}" data-drawer="${esc(s.sid)}" style="animation-delay:${Math.min(i, 30) * 18}ms">
+      <div class="top1"><div style="min-width:0"><div class="sid">${esc(s.sid)}</div><div class="prod">${esc(s.producto || 'Producto no identificado')}</div><div style="margin-top:8px">${st(s.calif)}</div></div>${anillo(p.total)}</div>
+      <div class="mini"><div><span>Prioritarios</span><b style="color:${p.pr ? 'var(--crit)' : 'inherit'}">${p.pr}</b></div><div><span>Hallazgos</span><b>${s.reportes.length ? abiertas(s).length : '—'}</b></div><div><span>Soporte</span><b>${etqSoporte(p.sp)}</b></div></div></div>`; };
+  const maxC = Math.max(1, ...lista.flatMap((s) => CATS.map((c) => abiertas(s).filter((a) => a.categoria === c).length)));
+  const heat = (k) => (k ? `<span class="celda-heat" style="background:color-mix(in oklab,var(--brand) ${Math.round(18 + (k / maxC) * 70)}%,var(--surface-2))">${k}</span>` : '<span class="muted">·</span>');
+  return `<div class="pagehead"><div><div class="eyebrow">Sistemas · EWA ${esc(fMes(estado.mes))}</div><h1>${lista.length} de ${SIDS.length} sistemas</h1><p class="sub">Clic en un sistema para ver su resumen; desde ahí abres la ficha completa.</p></div>
+    ${segm(q, 'vista', [['tarjetas', 'Tarjetas'], ['matriz', 'Matriz de riesgo']])}</div>
+  <div class="card">
     <div class="toolbar">
-      <input class="field" id="fTxt" placeholder="Filtrar por SID o texto…" value="${esc(q.get('q') || '')}" style="min-width:240px">
-      <select class="field" id="fCat"><option value="">Todas las categorías</option>${CATS.map((c) => `<option ${c === cat ? 'selected' : ''}>${esc(c)}</option>`).join('')}</select>
-      <select class="field" id="fPrio"><option value="">Toda prioridad</option><option value="si" ${pr === 'si' ? 'selected' : ''}>Atención prioritaria</option><option value="no" ${pr === 'no' ? 'selected' : ''}>Advertencia</option></select>
-      ${WEB ? `<select class="field" id="fSeg"><option value="">Todo seguimiento</option>${Object.entries(EST).map(([k, v]) => `<option value="${k}" ${k === sg ? 'selected' : ''}>${esc(v)}</option>`).join('')}</select>` : ''}
-      <span class="spacer"></span><span class="muted small">${f.length} resultados</span>
-      <button class="btn" data-csv="hall" data-n="hallazgos_ewa">Exportar CSV</button>
+      <input class="field" data-qtext="q" placeholder="Filtrar por SID, producto o host…" value="${esc(q.get('q') || '')}" style="min-width:250px">
+      ${segm(q, 'est', [['', 'Todos', base.length], ['rojo', 'Crítico', n('rojo')], ['amarillo', 'Advertencia', n('amarillo')], ['verde', 'Saludable', n('verde')], ['sin-datos', 'Sin calificación', n('sin-datos')]])}
+      ${segm(q, 'fuente', [['', 'Toda fuente'], ['ewa', 'Con EWA'], ['inv', 'Solo inventario']])}
+      <span class="spacer"></span>
+      <select class="field" data-qsel="orden"><option value="puntaje" ${orden === 'puntaje' ? 'selected' : ''}>Orden: puntaje de atención</option><option value="hallazgos" ${orden === 'hallazgos' ? 'selected' : ''}>Orden: hallazgos</option><option value="sid" ${orden === 'sid' ? 'selected' : ''}>Orden: SID</option></select>
     </div>
-    ${tabla('hall', [
-      { k: 'sid', t: 'SID', html: (x) => linkSid(x.sid) }, { k: 'calif', t: 'Sistema', html: (x) => st(x.calif), sort: (x) => -ORDEN[x.calif] },
-      { k: 'categoria', t: 'Categoría' }, { k: 'prioritaria', t: 'Prioridad', html: (x) => x.prioritaria ? '<span class="pill prio">Prioritaria</span>' : '<span class="pill">Advertencia</span>', sort: (x) => (x.prioritaria ? 0 : 1) },
-      { k: 'es', t: 'Hallazgo', w: 320, html: (x) => `${esc(x.es || x.generico)}${x.es ? `<div class="muted small">${esc(x.generico)}</div>` : ''}`, csv: (x) => x.es || x.generico },
-      { k: 'objeto', t: 'Objeto', html: (x) => (x.objeto ? `<span class="mono">${esc(x.objeto)}</span>` : '') }, { k: 'origen', t: 'Reporte', html: (x) => esc([...new Set(x.origen)].join(', ')) },
-      ...(WEB ? [{ k: 'seg', t: 'Seguimiento', html: (x) => chipSeg(x.sid, x), sort: (x) => estadoSeg(x.sid, x.texto),
-        csv: (x) => { const s = segDe(x.sid, x.texto) || {}; return [EST[s.estado || 'abierto'], s.responsable, s.fecha_compromiso, s.comentario].filter(Boolean).join(' · '); } }] : []),
-    ], f, { orden: 'prioritaria' })}
-  </div>`;
-};
-
-VISTAS.rendimiento = () => {
-  const filas = SIDS.map(sis).filter((s) => Object.keys(s.kpis).length).map((s) => ({ sid: s.sid, calif: s.calif, producto: s.producto, ...s.kpis }));
-  const inventarioPerf = SIDS.map(sis).filter((s) => !Object.keys(s.kpis).length && s.hosts.length).map((s) => ({
-    sid: s.sid, calif: s.calif, disponibilidad: pct(primero(s.hosts, 'dispSemanal')), respDialogo: primero(s.hosts, 'respDialogo'), respRFC: primero(s.hosts, 'respRFC'),
-    respHTTP: primero(s.hosts, 'respHTTP'), cpuApp: pct(primero(s.hosts, 'maxCpu')), tamanoBD: primero(s.hosts, 'tamanoBD'), usuariosTotales: primero(s.hosts, 'usuariosTotales'),
-  })).filter((x) => Object.entries(x).filter(([k]) => !['sid', 'calif'].includes(k)).some(([, v]) => !vacio(v)));
-  const cols = (extra) => [{ k: 'sid', t: 'SID', html: (x) => linkSid(x.sid) }, { k: 'calif', t: 'Estado', html: (x) => st(x.calif), sort: (x) => -ORDEN[x.calif] },
-    ...extra.map(([k, t]) => ({ k, t, num: true, sort: (x) => num(x[k]) }))];
-  const top = filas.filter((x) => num(x.respDialogo) != null).sort((a, b) => num(b.respDialogo) - num(a.respDialogo));
-  const topBD = filas.filter((x) => num(x.tamanoBD) != null).sort((a, b) => num(b.tamanoBD) - num(a.tamanoBD));
-  return `<div class="pagehead"><div><div class="eyebrow">Rendimiento · ${esc(fMes(estado.mes))}</div><h1>Indicadores de rendimiento</h1><p class="sub">Performance Indicators de los EWAs de aplicación ABAP; los sistemas sin EWA muestran lo capturado en el inventario.</p></div></div>
-  <div class="grid g-2">
-    <div class="card"><div class="card-h"><h2>Tiempo de respuesta en diálogo</h2><span class="muted">ms · promedio semanal</span></div>${top.length ? bars(top.map((x) => ({ t: x.sid, n: num(x.respDialogo), href: '#/sistema/' + x.sid, tip: `${x.sid}: ${x.respDialogo} (pico ${x.respPicoDialogo || '—'})` }))) : '<div class="empty">Sin datos</div>'}</div>
-    <div class="card"><div class="card-h"><h2>Tamaño de base de datos</h2><span class="muted">GB</span></div>${topBD.length ? bars(topBD.map((x) => ({ t: x.sid, n: Math.round(num(x.tamanoBD)), href: '#/sistema/' + x.sid, tip: `${x.sid}: ${x.tamanoBD} · crecimiento ${x.crecimientoBD || '—'}` }))) : '<div class="empty">Sin datos</div>'}</div>
+    ${!lista.length ? '<div class="empty">Ningún sistema coincide con el filtro</div>' : vista === 'matriz'
+      ? tabla('matriz', [
+        { k: 'sid', t: 'SID', html: (s) => `${st(s.calif, ' ')}<b>${esc(s.sid)}</b>`, sort: (s) => s.sid },
+        { k: 'producto', t: 'Producto', w: 180 },
+        { k: 'tipo', t: 'EWA', html: (s) => tipoDe(s).map((t) => `<span class="chip">${t}</span>`).join('') || '<span class="muted small">sin EWA</span>', csv: (s) => tipoDe(s).join(' + ') },
+        { k: 'p', t: 'Puntaje', num: true, sort: (s) => puntaje(s).total, html: (s) => `<span class="bullet"><span class="b"><span style="width:${puntaje(s).total}%"></span></span><b>${puntaje(s).total}</b></span>`, csv: (s) => puntaje(s).total },
+        ...CATS.map((c) => ({ k: 'c' + c, t: ({ 'Mantenimiento y versiones': 'Mantenim.', 'Respaldo y recuperación': 'Respaldo', 'Base de datos': 'Base datos', 'Rendimiento y capacidad': 'Rendim.', 'Operación y configuración': 'Operación' })[c] || c, num: true, sort: (s) => abiertas(s).filter((a) => a.categoria === c).length, html: (s) => heat(abiertas(s).filter((a) => a.categoria === c).length), csv: (s) => abiertas(s).filter((a) => a.categoria === c).length })),
+        { k: 'sp', t: 'Soporte', html: (s) => { const sp = puntaje(s).sp; return sp ? st(sp.est.c, etqSoporte(sp)) : '<span class="muted">—</span>'; }, sort: (s) => (puntaje(s).sp ? puntaje(s).sp.est.m : 999), csv: (s) => etqSoporte(puntaje(s).sp) },
+      ], lista, { orden: 'p', dir: -1, fila: (s) => `data-drawer="${esc(s.sid)}"` }) + `<div class="toolbar" style="margin:12px 0 0"><span class="muted small">Columnas de tema: hallazgos abiertos por categoría. Más oscuro = más hallazgos.</span><span class="spacer"></span><button class="btn" data-csv="matriz" data-n="matriz_riesgo">Exportar CSV</button></div>`
+      : `<div class="tarjetas">${lista.map(tarjeta).join('')}</div>`}
   </div>
-  <div class="card section"><div class="card-h"><h2>Detalle por sistema (EWA)</h2><button class="btn" data-csv="perf" data-n="rendimiento_ewa">Exportar CSV</button></div>
-  ${tabla('perf', cols([['disponibilidad', 'Disponib.'], ['usuariosActivos', 'Usuarios'], ['respDialogo', 'Resp. diálogo'], ['respPicoDialogo', 'Diálogo pico'], ['respRFC', 'Resp. RFC'], ['cpuApp', 'CPU App'], ['cpuBD', 'CPU BD'], ['bdDialogo', 'BD diálogo'], ['tamanoBD', 'Tamaño BD'], ['crecimientoBD', 'Crec. mes']]), filas, { orden: 'sid' })}</div>
-  ${inventarioPerf.length ? `<div class="card section"><div class="card-h"><h2>Detalle por sistema (inventario)</h2><button class="btn" data-csv="perfInv" data-n="rendimiento_inventario">Exportar CSV</button></div>
-  ${tabla('perfInv', cols([['disponibilidad', 'Disponib.'], ['respDialogo', 'Resp. diálogo'], ['respRFC', 'Resp. RFC'], ['respHTTP', 'Resp. HTTP'], ['cpuApp', 'CPU máx.'], ['tamanoBD', 'Tamaño BD'], ['usuariosTotales', 'Usuarios totales']]), inventarioPerf, { orden: 'sid' })}</div>` : ''}`;
+  <p class="metodo">${esc(METODO)}</p>`;
 };
 
+// ---------- ficha de sistema
+function resumenSistema(s, compacto) {
+  const p = puntaje(s), sp = p.sp;
+  const kv = CLAVE.map((k) => ({ k, ...indicador(s, k) }));
+  return `<div class="ikpi ${compacto ? 'c' : ''}">
+    ${kv.map((x) => `<div style="background:var(--surface-2);border-radius:12px;padding:12px 14px"><div class="muted small">${esc(x.d[1])}</div><div style="font-size:${compacto ? 18 : 22}px;font-weight:700;margin-top:2px;color:${alto(x) ? 'var(--warn)' : 'inherit'}">${x.v != null ? esc(x.v) : '<span class="muted">—</span>'}</div>${x.src ? `<span class="src">${esc(x.src)}</span>` : ''}</div>`).join('')}
+  </div>`;
+}
+VISTAS.sistema = (sid, q) => {
+  sid = (sid || '').toUpperCase();
+  if (!sid || !SIDS.includes(sid)) { location.replace('#/sistemas'); return ''; }
+  const s = sis(sid), p = puntaje(s), sp = p.sp, ab = abiertas(s), t = q.get('t') || 'resumen';
+  const rel = SIDS.filter((x) => x !== sid && familiaDe(x) === s.familia);
+  const eol = eolDe(sid);
+  const tipos = [...new Set(s.reportes.map((r) => r.tipo))];
+  const pestañas = [['resumen', 'Resumen'], ['hallazgos', 'Hallazgos', ab.length], ['rendimiento', 'Rendimiento'], ['infraestructura', 'Infraestructura', s.hosts.length + s.infra.length || null], ['ciclo', 'Ciclo de vida', eol.length || null], ['reportes', 'Reportes EWA', s.historia.length || null]];
+  const generales = [
+    ['Ambiente', s.ambiente], ['Despliegue', primero(s.hosts, 'despliegue')], ['Versión', s.version],
+    ['NetWeaver', primero(s.hosts, 'versionNW')], ['Kernel', primero(s.hosts, 'kernel')],
+    ['Base de datos', val(primero(s.hosts, 'bd')) || (s.principal && s.principal.baseDatos)],
+    ['Sistema operativo', val(primero(s.hosts, 'osVersion')) || val(primero(s.hosts, 'so')) || s.reportes.flatMap((r) => r.so || [])[0]],
+    ['Hardware', val(primero(s.hosts, 'hwTipo')) || val(primero(s.hosts, 'hwDescripcion'))],
+    ['Servidores App / BD', [val(primero(s.hosts, 'servidoresApp')), val(primero(s.hosts, 'servidoresBD'))].filter((x) => x != null).join(' / ')],
+    ['Periodo EWA', s.principal ? `${fFecha(s.principal.desde)} – ${fFecha(s.principal.hasta)}` : null],
+    ['Landscape', nombreFam(s.familia)],
+  ].filter(([, v]) => val(v) != null);
+  let cuerpo = '';
+  if (t === 'resumen') {
+    cuerpo = `${!s.reportes.length ? `<div class="note" style="margin-bottom:16px">Sin EarlyWatch Alert de <b>${esc(sid)}</b> en ${esc(fMes(estado.mes))}: calificación e indicadores provienen del inventario.</div>` : ''}
+    <div class="grid g12">
+      <div class="card s7"><div class="card-h"><h2>Indicadores clave</h2><a href="#/sistema/${esc(sid)}?t=rendimiento" class="small">Todos los indicadores →</a></div>${resumenSistema(s)}
+        <div class="atajos">
+          <a class="atajo" href="#/sistema/${esc(sid)}?t=hallazgos"><div><div class="muted">Hallazgos abiertos</div><span class="small" style="color:var(--crit)">${p.pr} prioritarios</span></div><b>${cnt(ab.length)}</b></a>
+          <a class="atajo" href="#/sistema/${esc(sid)}?t=ciclo"><div><div class="muted">Soporte más próximo</div><span class="small">${sp ? esc(sp.componente) + ' · ' + fFecha(sp.fecha) : 'Sin fechas'}</span></div><b style="font-size:15px">${sp ? st(sp.est.c, sp.est.t) : '—'}</b></a>
+          <a class="atajo" href="#/sistema/${esc(sid)}?t=infraestructura"><div><div class="muted">Servidores</div><span class="small">${s.infra.length ? s.infra.length + ' de infraestructura' : 'inventario'}</span></div><b>${cnt(s.hosts.length)}</b></a>
+        </div></div>
+      <div class="card s5"><div class="card-h"><h2>Datos generales</h2></div>
+        ${generales.length ? `<div class="dl">${generales.map(([k, v]) => `<div><span>${esc(k)}</span><b>${esc(v)}</b></div>`).join('')}</div>` : '<div class="empty">Sin datos generales en el inventario</div>'}
+        ${rel.length ? `<div style="margin-top:16px"><div class="muted small" style="margin-bottom:4px">Mismo landscape</div>${rel.map((x) => chipSid(x)).join('')}</div>` : ''}
+      </div>
+    </div>
+    ${val(primero(s.hosts, 'comentarios')) ? `<div class="note section"><b>Comentarios del inventario:</b> ${esc(primero(s.hosts, 'comentarios'))}</div>` : ''}`;
+  } else if (t === 'hallazgos') {
+    const porCat = CATS.map((c) => ({ c, a: s.alertas.filter((x) => x.categoria === c).sort((x, y) => (y.prioritaria ? 1 : 0) - (x.prioritaria ? 1 : 0)) })).filter((x) => x.a.length);
+    cuerpo = `<div class="card">${porCat.length ? porCat.map((g) => `<div class="card-h" style="margin:${g === porCat[0] ? 0 : 18}px 0 2px"><h3>${esc(g.c)}</h3><span class="pill">${g.a.length}</span></div>
+      ${g.a.map((a) => { const cerrado = ['resuelto', 'aceptado'].includes(estadoSeg(sid, a.texto)); return `<div class="fila-h" style="${cerrado ? 'opacity:.55' : ''}"><span class="dot ${a.prioritaria ? 'p' : ''}" title="${a.prioritaria ? 'Atención prioritaria' : 'Advertencia'}"></span>
+        <div>${esc(a.es || a.generico)}${a.objeto ? ` <span class="chip mono">${esc(a.objeto)}</span>` : ''}${a.es ? `<details class="en" style="padding-left:0"><summary>Texto original del EWA</summary>${esc(a.generico)}</details>` : ''}</div>
+        <div>${chipSeg(sid, a)}</div></div>`; }).join('')}`).join('') : `<div class="empty">${s.reportes.length ? 'El EWA no reporta hallazgos' : 'Sin EWA en el periodo'}</div>`}</div>`;
+  } else if (t === 'rendimiento') {
+    const filas = IND.filter(([k]) => !CLAVE.includes(k)).map(([k]) => ({ k, ...indicador(s, k) })).filter((x) => x.v != null);
+    const med = (k) => { const v = SIDS.map((x) => indicador(sis(x), k).n).filter((x) => x != null).sort((a, b) => a - b); return v.length ? v[Math.floor(v.length / 2)] : null; };
+    cuerpo = `<div class="card"><div class="card-h"><h2>Indicadores de rendimiento</h2><span class="muted">los 4 indicadores clave están en Resumen · comparación contra la mediana del landscape</span></div>
+      ${filas.length ? `<div class="tbl-wrap"><table><thead><tr><th>Indicador</th><th style="text-align:right">Valor</th><th>Fuente</th><th style="text-align:right">Mediana landscape</th><th style="text-align:right">vs. mediana</th></tr></thead><tbody>
+      ${filas.map((x) => { const m = med(x.k), r = m && x.n != null ? x.n / m : null; return `<tr><td>${esc(x.d[1])}</td><td class="num" style="color:${alto(x) ? 'var(--warn)' : 'inherit'}"><b>${esc(x.v)}</b></td><td><span class="src">${esc(x.src)}</span></td><td class="num muted">${m != null ? m.toLocaleString('es-MX') : '—'}</td><td class="num">${r != null ? `<span class="bullet ${r > 1.5 ? 'alto' : ''}"><span class="b"><span style="width:${Math.min(100, r * 50)}%"></span></span>${r.toFixed(1)}×</span>` : '—'}</td></tr>`; }).join('')}
+      </tbody></table></div>` : '<div class="empty">Sin indicadores adicionales para este sistema</div>'}</div>`;
+  } else if (t === 'infraestructura') {
+    const ewaHosts = [...new Set(s.reportes.flatMap((r) => r.hosts || []))].filter((h) => !s.hosts.some((x) => String(x.hostname || '').toLowerCase() === h));
+    cuerpo = `${s.hosts.length ? `<div class="card"><div class="card-h"><h2>Servidores del inventario</h2><span class="muted">${s.hosts.length}</span></div>${tabla('hosts-' + sid, [
+        { k: 'hostname', t: 'Host', html: (h) => `<span class="mono">${fmt(h.hostname)}</span>${h.componente ? ` <span class="chip">${esc(h.componente)}</span>` : ''}` }, { k: 'ip', t: 'IP', html: (h) => `<span class="mono">${fmt(h.ip)}</span>` },
+        { k: 'cpu', t: 'CPU' }, { k: 'memoria', t: 'Memoria', html: (h) => fmt(memoria(h.memoria)), sort: (h) => num(h.memoria) },
+        { k: 'osVersion', t: 'Sistema operativo', html: (h) => fmt(val(h.osVersion) || h.so) }, { k: 'hwTipo', t: 'Hardware', html: (h) => fmt(val(h.hwTipo) || h.hwDescripcion) },
+      ], s.hosts)}</div>` : ''}
+      ${ewaHosts.length ? `<div class="card section"><div class="card-h"><h2>Hosts reportados por el EWA</h2><span class="muted">no registrados en el inventario</span></div>${ewaHosts.map((h) => `<span class="chip mono">${esc(h)}</span>`).join('')}</div>` : ''}
+      ${s.infra.length ? `<div class="card section"><div class="card-h"><h2>Infraestructura asociada</h2><span class="muted">${s.infra.length}</span></div>${tabla('infra-' + sid, [{ k: 'hostname', t: 'Host', html: (h) => `<span class="mono">${fmt(h.hostname)}</span>` }, { k: 'ip', t: 'IP' }, { k: 'tipo', t: 'Tipo' }, { k: 'so', t: 'SO' }, { k: 'ramMB', t: 'RAM', html: (h) => fmt(memoria(h.ramMB)) }, { k: 'ubicacion', t: 'Ubicación' }, { k: 'descripcion', t: 'Descripción', w: 240 }], s.infra)}</div>` : ''}
+      ${!s.hosts.length && !ewaHosts.length && !s.infra.length ? '<div class="card empty">Sin servidores registrados</div>' : ''}`;
+  } else if (t === 'ciclo') {
+    cuerpo = `<div class="card">${eol.length ? lineaTiempo(eol, true) + `<div class="section">${tabla('eol-' + sid, [{ k: 'componente', t: 'Componente' }, { k: 'ref', t: 'Referencia', w: 220 }, { k: 'tipo', t: 'Soporte' }, { k: 'fecha', t: 'Fecha', html: (e) => fFecha(e.fecha) }, { k: 'est', t: 'Estado', html: (e) => st(e.est.c, e.est.t), sort: (e) => e.est.m }, { k: 'fuente', t: 'Fuente' }], eol, { orden: 'fecha' })}</div>` : '<div class="empty">Sin fechas de fin de soporte registradas</div>'}
+      ${['mesesSinKernel', 'mesesSinComponentes', 'mesesSinBD'].some((x) => val(primero(s.hosts, x)) != null) ? `<div class="dl section"><div><span>Meses sin actualizar kernel</span><b>${fmt(primero(s.hosts, 'mesesSinKernel'))}</b></div><div><span>Meses sin actualizar componentes</span><b>${fmt(primero(s.hosts, 'mesesSinComponentes'))}</b></div><div><span>Meses sin actualizar BD</span><b>${fmt(primero(s.hosts, 'mesesSinBD'))}</b></div></div>` : ''}</div>`;
+  } else {
+    const porMes = {}; for (const r of s.historia) (porMes[r.mes] ||= []).push(r);
+    const areas = {}; for (const r of s.reportes) for (const a of r.areas || []) { const k = a.tema.replace(new RegExp(`\\b${sid}\\b`, 'g'), '').trim(); (areas[k] ||= new Set()); for (const x of a.sub) areas[k].add(x); }
+    cuerpo = `<div class="card"><div class="card-h"><h2>Reportes del periodo</h2><span class="muted">aplicación y bases de datos HANA</span></div>${s.reportes.length ? tabla('rep-' + sid, [
+        { k: 'tipo', t: 'Tipo' }, { k: 'producto', t: 'Producto' }, { k: 'baseDatos', t: 'Base de datos' },
+        { k: 'periodo', t: 'Periodo', html: (r) => `${fFecha(r.desde)} – ${fFecha(r.hasta)}`, sort: (r) => r.desde },
+        { k: 'calificacion', t: 'Calificación', html: (r) => st(r.calificacion), sort: (r) => -ORDEN[r.calificacion] },
+        { k: 'alertas', t: 'Hallazgos', num: true, html: (r) => r.alertas.length, sort: (r) => r.alertas.length },
+        { k: 'archivo', t: 'Archivo', html: (r) => linkArchivo(r) + (r.duplicados ? `<div class="muted small">duplicados: ${esc(r.duplicados.join(', '))}</div>` : '') },
+      ], s.reportes) : '<div class="empty">Sin EWA en el periodo</div>'}</div>
+      <div class="grid g-2 section">
+        <div class="card"><div class="card-h"><h2>Histórico mensual</h2></div>${Object.keys(porMes).length ? `<div class="tbl-wrap"><table><thead><tr><th>Mes</th><th>Calificación</th><th style="text-align:right">Hallazgos</th></tr></thead><tbody>${Object.keys(porMes).sort().reverse().map((m) => { const x = sistema(sid, m); return `<tr><td>${esc(fMes(m))}</td><td>${st(x.calif)}</td><td class="num">${x.alertas.length}</td></tr>`; }).join('')}</tbody></table></div>${Object.keys(porMes).length === 1 ? '<p class="muted small">La tendencia aparecerá al publicar los EWAs de los siguientes meses.</p>' : ''}` : '<div class="empty">Sin EWAs</div>'}</div>
+        <div class="card"><div class="card-h"><h2>Áreas revisadas por el EWA</h2></div>${Object.keys(areas).length ? Object.entries(areas).map(([k, v]) => `<details style="margin-bottom:6px"><summary><b class="small">${esc(k)}</b> <span class="muted small">${v.size}</span></summary><div style="margin-top:6px">${[...v].map((x) => `<span class="chip">${esc(x)}</span>`).join('')}</div></details>`).join('') : '<div class="empty">Sin detalle</div>'}</div>
+      </div>`;
+  }
+  return `<div class="card ficha-h">
+      <div style="min-width:0"><div class="eyebrow"><a href="#/sistemas" style="color:inherit">Sistemas</a> · EWA ${esc(fMes(estado.mes))}</div>
+        <div class="sidbig" style="margin-top:8px">${esc(sid)}</div>
+        <div class="prodl">${esc(s.producto || 'Producto no identificado')}</div>
+        <div class="chips">${st(s.calif)} <span class="muted small">· fuente ${esc(s.fuenteCalif || '—')}</span> ${tipos.map((x) => `<span class="chip">${esc(x)}</span>`).join('')}</div></div>
+      <div class="ficha-score">${anillo(p.total, true)}<div class="desg"><div><span class="muted">Prioridad de atención</span><b>${nivel(p.total)[1]}</b></div>${p.partes.map(([k, n]) => `<div><span class="muted">${esc(k)}</span><b>${n}</b></div>`).join('')}</div></div>
+    </div>
+    <nav class="ftabs">${pestañas.map(([k, txt, n]) => `<a href="#/sistema/${esc(sid)}?t=${k}" class="${t === k ? 'on' : ''}">${txt}${n ? `<span class="n">${n}</span>` : ''}</a>`).join('')}</nav>
+    ${cuerpo}`;
+};
+
+// ---------- panel lateral (vista rápida)
+function contenidoDrawer(sid) {
+  const s = sis(sid), p = puntaje(s), ab = abiertas(s);
+  const top = ab.filter((a) => a.prioritaria).concat(ab.filter((a) => !a.prioritaria)).slice(0, 4);
+  return `<button class="btn cerrar" data-cerrar aria-label="Cerrar">✕</button>
+    <div class="eyebrow">Vista rápida</div>
+    <div style="display:flex;justify-content:space-between;gap:16px;align-items:center;margin-top:8px">
+      <div><div style="font-size:34px;font-weight:800;letter-spacing:.02em">${esc(sid)}</div><div class="muted">${esc(s.producto || '—')}</div><div style="margin-top:6px">${st(s.calif)} <span class="muted small">· ${esc(s.fuenteCalif || 'sin fuente')}</span></div></div>
+      ${anillo(p.total, true)}
+    </div>
+    <div class="pila" style="margin:16px 0 6px" data-tip="${esc(p.partes.map(([t, n]) => `${t}: ${n}`).join('\n'))}">${p.partes.map(([, n], j) => (n ? `<span class="p${j + 1}" style="width:${n}%"></span>` : '')).join('')}</div>
+    <div class="ley-pila" style="margin-top:4px">${p.partes.map(([t, n], j) => `<span><i class="p${j + 1}"></i>${esc(t)} ${n}</span>`).join('')}</div>
+    <h3 style="margin:20px 0 8px">Indicadores clave</h3>${resumenSistema(s, true)}
+    <h3 style="margin:20px 0 4px">Hallazgos a atender <span class="muted small">(${ab.length} abiertos · ${p.pr} prioritarios)</span></h3>
+    ${top.length ? top.map((a) => `<div class="fila-h"><span class="dot ${a.prioritaria ? 'p' : ''}"></span><div class="small">${esc(a.es || a.generico)}</div><span></span></div>`).join('') : `<div class="muted small">${s.reportes.length ? 'Sin hallazgos abiertos' : 'Sin EWA en el periodo'}</div>`}
+    <h3 style="margin:20px 0 6px">Soporte más próximo</h3>
+    ${p.sp ? `<div class="small">${st(p.sp.est.c, p.sp.est.t)} · ${esc(p.sp.componente)} ${p.sp.ref ? '· ' + esc(p.sp.ref) : ''} · ${fFecha(p.sp.fecha)}</div>` : '<div class="muted small">Sin fechas registradas</div>'}
+    <a class="btn primary" style="margin-top:24px;width:100%;justify-content:center;height:42px" href="#/sistema/${esc(sid)}">Abrir ficha completa →</a>`;
+}
+
+// ---------- hallazgos agrupados por tema
+VISTAS.hallazgos = (_, q) => {
+  const inst = [];
+  for (const sid of SIDS) { const s = sis(sid); for (const a of s.alertas) inst.push({ sid, calif: s.calif, ...a, seg: estadoSeg(sid, a.texto) }); }
+  const cat = q.get('cat') || '', pr = q.get('prio') || '', sg = q.get('seg') || '', txt = (q.get('q') || '').toLowerCase(), vista = q.get('vista') || 'temas';
+  const pasa = (x, sinCat) => (sinCat || !cat || x.categoria === cat) && (!pr || (pr === 'si') === x.prioritaria) && (!sg || x.seg === sg)
+    && (!txt || (x.sid + ' ' + x.texto + ' ' + (x.es || '') + ' ' + ((segDe(x.sid, x.texto) || {}).responsable || '')).toLowerCase().includes(txt));
+  const base = inst.filter((x) => pasa(x, true)), f = base.filter((x) => pasa(x));
+  const grupos = {};
+  for (const x of f) { const k = x.generico; (grupos[k] ||= { k, es: x.es, categoria: x.categoria, prioritaria: x.prioritaria, items: [] }).items.push(x); }
+  const lista = Object.values(grupos).sort((a, b) => (b.prioritaria - a.prioritaria) || (new Set(b.items.map((i) => i.sid)).size - new Set(a.items.map((i) => i.sid)).size));
+  const nCat = (c) => new Set(base.filter((x) => !c || x.categoria === c).map((x) => x.generico)).size;
+  const colorSeg = { abierto: 'var(--surface-3)', en_atencion: 'var(--brand)', resuelto: 'var(--good)', aceptado: 'var(--muted)' };
+  const tarjeta = (g, i) => {
+    const sids = [...new Set(g.items.map((x) => x.sid))];
+    const est = Object.keys(EST).map((k) => [k, g.items.filter((x) => x.seg === k).length]);
+    return `<div class="hgrupo" style="animation-delay:${Math.min(i, 20) * 25}ms">
+      <div class="h1r"><span class="ico ${g.prioritaria ? 'p' : ''}">${g.prioritaria ? '!' : '•'}</span>
+        <div><div class="tt">${esc(g.es || g.k)}</div><div class="meta"><span>${esc(g.categoria)}</span><span>${g.prioritaria ? '<span style="color:var(--crit)">Atención prioritaria</span>' : 'Advertencia'}</span>${g.items.length > sids.length ? `<span>${g.items.length} objetos (tenants / componentes)</span>` : ''}</div></div>
+        <div class="cnt"><b>${cnt(sids.length)}</b><span>${sids.length === 1 ? 'sistema' : 'sistemas'}</span>${WEB ? `<div class="seguir" data-tip="${esc(est.map(([k, n]) => `${EST[k]}: ${n}`).join('\n'))}">${est.map(([k, n]) => (n ? `<span style="width:${(n / g.items.length) * 100}%;background:${colorSeg[k]}"></span>` : '')).join('')}</div>` : ''}</div></div>
+      <div class="sids">${sids.map((sid) => { const it = g.items.find((x) => x.sid === sid); const marca = WEB && it.seg !== 'abierto' ? (it.seg === 'resuelto' ? ' ✓' : it.seg === 'aceptado' ? ' ⊘' : ' ◔') : '';
+        return puedeEditar() ? `<button type="button" class="chip" data-seg="${esc(sid)}" data-h="${esc(it.texto)}" data-tip="${esc(sid + ' · ' + EST[it.seg] + '\nClic para registrar seguimiento')}"><span class="d ${grupoCal(sis(sid).calif)}"></span>${esc(sid)}${marca}</button>` : chipSid(sid, marca); }).join('')}</div>
+      ${g.es ? `<details class="en"><summary>Texto original del EWA</summary>${esc(g.k)}</details>` : ''}</div>`;
+  };
+  return `<div class="pagehead"><div><div class="eyebrow">Hallazgos · EWA ${esc(fMes(estado.mes))}</div><h1>${lista.length} tipos de hallazgo en ${new Set(f.map((x) => x.sid)).size} sistemas</h1>
+    <p class="sub">Cada hallazgo aparece una sola vez con los sistemas donde se presenta.${WEB && puedeEditar() ? ' Clic en un sistema para registrar su seguimiento.' : ''}</p></div>
+    ${segm(q, 'vista', [['temas', 'Por tema'], ['detalle', 'Detalle por sistema']])}</div>
+  <div class="card">
+    <div class="toolbar">${segm(q, 'cat', [['', 'Todas', nCat('')], ...CATS.map((c) => [c, c, nCat(c)])])}</div>
+    <div class="toolbar"><input class="field" data-qtext="q" placeholder="Buscar SID, texto o responsable…" value="${esc(q.get('q') || '')}" style="min-width:250px">
+      ${segm(q, 'prio', [['', 'Toda prioridad'], ['si', 'Prioritarios'], ['no', 'Advertencias']])}
+      ${WEB ? segm(q, 'seg', [['', 'Todo seguimiento'], ...Object.entries(EST)]) : ''}
+      <span class="spacer"></span>${vista === 'detalle' ? '<button class="btn" data-csv="hall" data-n="hallazgos_ewa">Exportar CSV</button>' : ''}</div>
+    ${vista === 'detalle' ? tabla('hall', [
+      { k: 'sid', t: 'SID', html: (x) => `${st(x.calif, ' ')}<b>${esc(x.sid)}</b>`, sort: (x) => x.sid },
+      { k: 'categoria', t: 'Categoría' }, { k: 'prioritaria', t: 'Prioridad', html: (x) => (x.prioritaria ? '<span class="pill prio">Prioritaria</span>' : '<span class="pill">Advertencia</span>'), sort: (x) => (x.prioritaria ? 0 : 1) },
+      { k: 'es', t: 'Hallazgo', w: 320, html: (x) => esc(x.es || x.generico), csv: (x) => x.es || x.generico },
+      { k: 'objeto', t: 'Objeto', html: (x) => (x.objeto ? `<span class="mono">${esc(x.objeto)}</span>` : '') },
+      ...(WEB ? [{ k: 'seg', t: 'Seguimiento', html: (x) => chipSeg(x.sid, x), sort: (x) => x.seg, csv: (x) => { const s = segDe(x.sid, x.texto) || {}; return [EST[s.estado || 'abierto'], s.responsable, s.fecha_compromiso, s.comentario].filter(Boolean).join(' · '); } }] : []),
+    ], f, { orden: 'prioritaria' }) : (lista.map(tarjeta).join('') || '<div class="empty">Sin hallazgos con estos filtros</div>')}
+  </div>
+  <p class="metodo">La categoría y la marca de atención prioritaria se asignan por palabras clave del texto del EWA (riesgo de seguridad, soporte vencido, autorizaciones críticas); complementan, no sustituyen, la calificación de SAP.</p>`;
+};
+
+// ---------- rendimiento comparativo
+VISTAS.rendimiento = () => {
+  const cols = ['disponibilidad', 'respDialogo', 'respRFC', 'cpuApp', 'cpuBD', 'tamanoBD', 'crecimientoBD', 'usuariosActivos'];
+  const filas = SIDS.map(sis).map((s) => { const o = { sid: s.sid, calif: s.calif, s }; let n = 0; for (const k of cols) { o[k] = indicador(s, k); if (o[k].v != null) n++; } o.n = n; return o; }).filter((o) => o.n);
+  const max = Object.fromEntries(cols.map((k) => [k, Math.max(1, ...filas.map((o) => o[k].n || 0))]));
+  const destaca = (k, t, inv) => { const c = filas.filter((o) => o[k].n != null).sort((a, b) => (inv ? a[k].n - b[k].n : b[k].n - a[k].n))[0]; return c ? `<div class="card kpi link" data-drawer="${esc(c.sid)}"><div class="lbl">${esc(t)}</div><div class="val" style="font-size:24px">${esc(c[k].v)}</div><div class="foot"><b>${esc(c.sid)}</b> · <span class="src">${esc(c[k].src)}</span></div></div>` : ''; };
+  const celda = (o, k) => { const x = o[k]; if (x.v == null) return '<span class="muted">—</span>'; const pc = x.n != null ? (x.n / max[k]) * 100 : 0; return `<span class="bullet ${alto(x) ? 'alto' : ''}" data-tip="${esc(x.d[1] + ': ' + x.v + ' (' + x.src + ')')}"><span class="b"><span style="width:${k === 'disponibilidad' ? x.n : pc}%"></span></span>${esc(x.v)}</span>`; };
+  return `<div class="pagehead"><div><div class="eyebrow">Rendimiento · EWA ${esc(fMes(estado.mes))}</div><h1>Rendimiento comparado</h1><p class="sub">${filas.length} sistemas con indicadores. EWA cuando existe; si no, inventario. En ámbar, valores fuera de umbral (diálogo/RFC &gt; 1 s, CPU &gt; 70 %, disponibilidad &lt; 99 %).</p></div></div>
+  <div class="grid g-kpi">${destaca('respDialogo', 'Mayor tiempo de diálogo')}${destaca('cpuApp', 'Mayor CPU en servidor App')}${destaca('tamanoBD', 'Base de datos más grande')}${destaca('crecimientoBD', 'Mayor crecimiento mensual')}</div>
+  <div class="card section"><div class="toolbar"><span class="muted small">Barras relativas al máximo de cada columna.</span><span class="spacer"></span><button class="btn" data-csv="perf" data-n="rendimiento">Exportar CSV</button></div>
+  ${tabla('perf', [{ k: 'sid', t: 'SID', html: (o) => `${st(o.calif, ' ')}<b>${esc(o.sid)}</b>`, sort: (o) => o.sid },
+    ...cols.map((k) => ({ k, t: IND.find((d) => d[0] === k)[1].replace('Resp. promedio ', 'Resp. ').replace('CPU máx. servidor ', 'CPU '), num: true, sort: (o) => o[k].n, html: (o) => celda(o, k), csv: (o) => o[k].v || '' }))],
+    filas, { orden: 'respDialogo', dir: -1, fila: (o) => `data-drawer="${esc(o.sid)}"` })}</div>`;
+};
+
+// ---------- ciclo de vida
+function lineaTiempo(items, unSid) {
+  const ini = new Date(HOY); ini.setMonth(ini.getMonth() - 12);
+  const fin = new Date(HOY); fin.setMonth(fin.getMonth() + 36);
+  const x = (iso) => Math.max(0, Math.min(100, ((new Date(iso) - ini) / (fin - ini)) * 100));
+  const xh = x(HOY.toISOString());
+  const marcas = []; for (let a = ini.getFullYear(); a <= fin.getFullYear() + 1; a++) { const d = new Date(a, 0, 1); if (d >= ini && d <= fin) marcas.push([x(d.toISOString()), a]); }
+  const filas = ['Producto SAP', 'Base de datos', 'Sistema operativo', 'Hardware'].map((c) => {
+    const g = {};
+    for (const e of items.filter((e) => e.componente === c && e.tipo !== 'Extendido')) (g[e.fecha] ||= { fecha: e.fecha, est: e.est, items: [] }).items.push(e);
+    return [c, Object.values(g).sort((a, b) => a.fecha.localeCompare(b.fecha))];
+  }).filter(([, v]) => v.length);
+  const burbuja = (b, i, c) => {
+    const sids = [...new Set(b.items.map((e) => e.sid))], n = sids.length, d = Math.round(14 + Math.min(18, Math.sqrt(n) * 5));
+    const refs = [...new Set(b.items.map((e) => e.ref).filter(Boolean))].slice(0, 3);
+    const tipTxt = `${c} · ${fFecha(b.fecha)} · ${b.est.t}${new Date(b.fecha) < ini ? ' (antes del rango mostrado)' : ''}${refs.length ? '\n' + refs.join(' | ') : ''}${unSid ? '' : '\n' + n + (n === 1 ? ' sistema: ' : ' sistemas: ') + sids.slice(0, 12).join(', ') + (n > 12 ? '…' : '')}`;
+    const accion = unSid ? '' : n === 1 ? `data-drawer="${esc(sids[0])}"` : `data-href="#/ciclo?vista=tabla&f=${b.fecha}&c=${encodeURIComponent(c)}"`;
+    return `<span class="tl-p ${b.est.c}" style="left:${x(b.fecha)}%;width:${d}px;height:${d}px;margin:-${d / 2}px 0 0 -${d / 2}px;animation-delay:${i * 40}ms" ${accion} data-tip="${esc(tipTxt)}">${n > 1 ? n : ''}</span>`;
+  };
+  return `<div class="tl"><div class="tl-eje">${marcas.map(([p, a]) => `<span style="left:${p}%">${a}</span>`).join('')}<span class="hoy-l" style="left:${xh}%">Hoy</span></div>
+    ${filas.map(([c, v]) => `<div class="tl-row"><div class="lbl">${esc(c)} <span class="muted small">${v.reduce((a, b) => a + b.items.length, 0)}</span></div><div class="pista"><div class="tl-zona" style="left:0;width:${xh}%"></div><div class="tl-hoy" style="left:${xh}%"></div>${v.map((b, i) => burbuja(b, i, c)).join('')}</div></div>`).join('')}</div>
+    <div class="ley-pila"><span>${st('rojo', 'Vencido o ≤ 6 meses')}</span><span>${st('amarillo', '6–18 meses')}</span><span>${st('verde', '> 18 meses')}</span><span class="muted">Tamaño y número = sistemas con esa fecha · zona sombreada = pasado · soporte estándar / mainstream${unSid ? '' : ' · clic para ver el detalle'}</span></div>`;
+}
 VISTAS.ciclo = (_, q) => {
-  const todos = SIDS.flatMap(eolDe);
-  const filtro = q.get('e') || '';
-  const f = todos.filter((e) => !filtro || e.est.t === filtro);
-  const grupos = ['Vencido', '≤ 6 meses', '6–18 meses', '> 18 meses'].map((t) => ({ t, n: todos.filter((e) => e.est.t === t).length }));
-  const clr = { 'Vencido': 'rojo', '≤ 6 meses': 'rojo', '6–18 meses': 'amarillo', '> 18 meses': 'verde' };
-  return `<div class="pagehead"><div><div class="eyebrow">Ciclo de vida</div><h1>Fin de soporte de componentes</h1><p class="sub">Hardware, sistema operativo, producto SAP y base de datos · fechas del inventario y del EWA · referencia: hoy ${fFecha(HOY.toISOString().slice(0, 10))}</p></div></div>
-  <div class="grid g-kpi">${grupos.map((g) => `<a href="#/ciclo?e=${encodeURIComponent(g.t)}" style="color:inherit;text-decoration:none">${kpi(g.t, `<span style="color:${COLOR[clr[g.t]]}">${g.n}</span>`, 'fechas de soporte')}</a>`).join('')}</div>
-  <div class="card section"><div class="toolbar"><b>${filtro ? esc(filtro) : 'Todos los vencimientos'}</b>${filtro ? ' <a href="#/ciclo">quitar filtro</a>' : ''}<span class="spacer"></span><button class="btn" data-csv="eol" data-n="ciclo_de_vida">Exportar CSV</button></div>
-  ${tabla('eol', [{ k: 'sid', t: 'SID', html: (e) => linkSid(e.sid) }, { k: 'componente', t: 'Componente' }, { k: 'ref', t: 'Referencia' }, { k: 'tipo', t: 'Soporte' },
-    { k: 'fecha', t: 'Fecha', html: (e) => fFecha(e.fecha) }, { k: 'est', t: 'Estado', html: (e) => st(e.est.c, e.est.t), sort: (e) => e.est.m, csv: (e) => e.est.t }, { k: 'fuente', t: 'Fuente' }], f, { orden: 'fecha' })}</div>`;
+  const todos = SIDS.flatMap(eolDe), e = q.get('e') || '', vista = q.get('vista') || 'linea';
+  const grupo = (x) => (x.est.m <= 6 ? 'riesgo' : x.est.m <= 18 ? 'medio' : 'ok');
+  const ff = q.get('f'), fc = q.get('c');
+  const f = todos.filter((x) => (!e || grupo(x) === e) && (!ff || x.fecha === ff) && (!fc || x.componente === fc));
+  const n = (g) => todos.filter((x) => x.tipo !== 'Extendido' && grupo(x) === g).length;
+  return `<div class="pagehead"><div><div class="eyebrow">Ciclo de vida</div><h1>Fin de soporte de componentes</h1><p class="sub">Producto SAP, base de datos, sistema operativo y hardware · fechas del inventario y del EWA · hoy ${fFecha(HOY.toISOString().slice(0, 10))}</p></div>
+    ${segm(q, 'vista', [['linea', 'Línea de tiempo'], ['tabla', 'Tabla']])}</div>
+  <div class="card"><div class="toolbar">${segm(q, 'e', [['', 'Todo'], ['riesgo', 'Vencido o ≤ 6 meses', n('riesgo')], ['medio', '6–18 meses', n('medio')], ['ok', '> 18 meses', n('ok')]])}${ff || fc ? `<span class="chip">${esc(fc || '')} ${ff ? '· ' + fFecha(ff) : ''} <a href="#/ciclo?vista=tabla" style="margin-left:4px">✕</a></span>` : ''}<span class="spacer"></span>${vista === 'tabla' ? '<button class="btn" data-csv="eol" data-n="ciclo_de_vida">Exportar CSV</button>' : ''}</div>
+  ${!f.length ? '<div class="empty">Sin fechas con este filtro</div>' : vista === 'tabla'
+    ? tabla('eol', [{ k: 'sid', t: 'SID', html: (x) => `<b>${esc(x.sid)}</b>` }, { k: 'componente', t: 'Componente' }, { k: 'ref', t: 'Referencia', w: 220 }, { k: 'tipo', t: 'Soporte' },
+      { k: 'fecha', t: 'Fecha', html: (x) => fFecha(x.fecha) }, { k: 'est', t: 'Estado', html: (x) => st(x.est.c, x.est.t), sort: (x) => x.est.m, csv: (x) => x.est.t }, { k: 'fuente', t: 'Fuente' }], f, { orden: 'fecha', fila: (x) => `data-drawer="${esc(x.sid)}"` })
+    : lineaTiempo(f, false)}</div>`;
 };
 
 VISTAS.inventario = (_, q) => {
@@ -503,7 +617,7 @@ VISTAS.inventario = (_, q) => {
   <div class="card"><div class="toolbar">
     <a class="btn ${vista === 'sap' ? 'primary' : ''}" href="#/inventario?v=sap${txt ? '&q=' + encodeURIComponent(txt) : ''}" style="display:inline-flex;align-items:center;text-decoration:none;color:inherit">Sistemas SAP (${inv.hosts.length})</a>
     <a class="btn ${vista === 'infra' ? 'primary' : ''}" href="#/inventario?v=infra${txt ? '&q=' + encodeURIComponent(txt) : ''}" style="display:inline-flex;align-items:center;text-decoration:none;color:inherit">Infraestructura (${(inv.infra || []).length})</a>
-    <input class="field" id="fInv" data-v="${vista}" placeholder="Buscar host, IP, SID, SO…" value="${esc(q.get('q') || '')}" style="min-width:260px">
+    <input class="field" data-qtext="q" placeholder="Buscar host, IP, SID, SO…" value="${esc(q.get('q') || '')}" style="min-width:260px">
     <span class="spacer"></span><button class="btn" data-csv="${vista === 'sap' ? 'inv' : 'infra'}" data-n="inventario_${vista}">Exportar CSV</button></div>
   ${vista === 'sap' ? tabla('inv', [{ k: 'sid', t: 'SID', html: (h) => linkSid(h.sid) + (h.componente ? ` <span class="chip">${esc(h.componente)}</span>` : '') }, { k: 'ambiente', t: 'Ambiente' }, { k: 'hostname', t: 'Host', html: (h) => `<span class="mono">${fmt(h.hostname)}</span>` },
     { k: 'ip', t: 'IP', html: (h) => `<span class="mono">${fmt(h.ip)}</span>` }, { k: 'producto', t: 'Producto' }, { k: 'versionProducto', t: 'Versión' }, { k: 'kernel', t: 'Kernel' }, { k: 'cpu', t: 'CPU' },
@@ -543,9 +657,9 @@ VISTAS.cobertura = () => {
     ${dups.map((r) => `<div class="finding"><span class="dot"></span><div><b class="mono">${esc(r.duplicados.join(', '))}</b> — mismo contenido que <span class="mono">${esc(r.archivo)}</span> (${esc(r.sid)}); se contó una sola vez.</div></div>`).join('')}</div>` : ''}`;
 };
 
+
 // ------------------------------------------------------------------ administración (versión web)
 const ROLES = { admin: 'Administrador', editor: 'Edición', consulta: 'Consulta' };
-const fHora = (t) => (t ? new Date(t).toLocaleString('es-MX', { dateStyle: 'medium', timeStyle: 'short' }) : '—');
 const aviso = (id, txt, ok) => { const el = document.getElementById(id); if (el) { el.textContent = txt; el.style.color = ok ? 'var(--good)' : 'var(--crit)'; } };
 
 VISTAS.publicar = () => `<div class="pagehead"><div><div class="eyebrow">Administración</div><h1>Publicar datos</h1>
@@ -760,92 +874,148 @@ VISTAS.accesos.despues = async () => {
   });
 };
 
-// ------------------------------------------------------------------ router y eventos
+// ------------------------------------------------------------------ router, animación y eventos
+const ALIAS = { resumen: 'panorama' };
 function ruta() {
-  const h = location.hash.replace(/^#\/?/, '') || 'resumen';
+  const h = location.hash.replace(/^#\/?/, '') || 'panorama';
   const [p, qs] = h.split('?');
-  const [v, arg] = p.split('/');
-  return { v: VISTAS[v] ? v : 'resumen', arg: arg ? decodeURIComponent(arg) : '', q: new URLSearchParams(qs || '') };
+  let [v, arg] = p.split('/');
+  v = ALIAS[v] || v;
+  return { v: VISTAS[v] ? v : 'panorama', arg: arg ? decodeURIComponent(arg) : '', q: new URLSearchParams(qs || '') };
 }
+// Animaciones: conteo de cifras y trazo de anillos/donas.
+function animar(raiz) {
+  const reducir = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  raiz.querySelectorAll('[data-cnt]').forEach((el) => {
+    const fin = +el.dataset.cnt, dec = +el.dataset.dec || 0, f = (v) => v.toLocaleString('es-MX', { minimumFractionDigits: dec, maximumFractionDigits: dec });
+    if (reducir || !fin) { el.textContent = f(fin); return; }
+    const t0 = performance.now(), dur = 900;
+    const paso = (t) => { const k = Math.min(1, (t - t0) / dur), e = 1 - Math.pow(1 - k, 3); el.textContent = f(fin * e); if (k < 1) requestAnimationFrame(paso); };
+    requestAnimationFrame(paso);
+  });
+  requestAnimationFrame(() => requestAnimationFrame(() => raiz.querySelectorAll('[data-dash]').forEach((c) => c.setAttribute('stroke-dasharray', c.dataset.dash))));
+}
+let rutaPrevia = '';
 function render() {
   const r = ruta();
   const permitida = !VISTAS[r.v].roles || (YO && VISTAS[r.v].roles.includes(YO.rol));
-  app.innerHTML = permitida ? VISTAS[r.v](r.arg, r.q) : '<div class="card empty">No tienes permiso para esta sección.</div>';
+  const html = permitida ? VISTAS[r.v](r.arg, r.q) : '<div class="card empty">No tienes permiso para esta sección.</div>';
+  const misma = rutaPrevia === r.v + '/' + r.arg;
+  app.innerHTML = `<div class="${misma ? '' : 'vista'}">${html}</div>`;
+  rutaPrevia = r.v + '/' + r.arg;
   if (permitida && VISTAS[r.v].despues) VISTAS[r.v].despues(r);
-  document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('on', a.dataset.r === r.v));
-  if (r.v === 'sistema' && r.arg) $('#tabs a[data-r=sistema]').href = '#/sistema/' + encodeURIComponent(r.arg);
+  const tab = r.v === 'sistema' ? 'sistemas' : r.v;
+  document.querySelectorAll('#tabs a').forEach((a) => a.classList.toggle('on', a.dataset.r === tab));
   document.title = (r.v === 'sistema' && r.arg ? r.arg.toUpperCase() + ' · ' : '') + 'Salud de Sistemas SAP';
+  animar(app);
 }
-window.addEventListener('hashchange', () => { render(); window.scrollTo(0, 0); });
+window.addEventListener('hashchange', () => { cerrarDrawer(); render(); window.scrollTo(0, 0); });
+const navegar = (hash, reemplazar) => { if (reemplazar) { history.replaceState(null, '', hash); const y = window.scrollY; render(); window.scrollTo(0, y); } else location.hash = hash; };
 
+// periodo
 const selMes = $('#selMes');
 selMes.innerHTML = meses.length ? meses.map((m) => `<option value="${m}" ${m === estado.mes ? 'selected' : ''}>EWA ${esc(fMes(m))}</option>`).join('') : '<option>Sin EWAs</option>';
-selMes.addEventListener('change', () => { estado.mes = selMes.value; CACHE = {}; try { localStorage.setItem('tablero.mes', estado.mes); } catch {} render(); });
+selMes.addEventListener('change', () => { estado.mes = selMes.value; CACHE = {}; try { localStorage.setItem('tablero.mes', estado.mes); } catch {} render(); pintarVivo(); });
 
 // tema
 const aplicarTema = (t) => { document.documentElement.dataset.theme = t; try { localStorage.setItem('tablero.tema', t); } catch {} };
 try { aplicarTema(localStorage.getItem('tablero.tema') || 'dark'); } catch { aplicarTema('dark'); }
 $('#btnTema').addEventListener('click', () => aplicarTema(document.documentElement.dataset.theme === 'light' ? 'dark' : 'light'));
 
-// buscador de SID
-const busca = $('#buscaSid'), lista = $('#comboList');
-let act = 0;
-function opciones() {
-  const t = busca.value.trim().toLowerCase();
-  return SIDS.map(sis).filter((s) => !t || s.sid.toLowerCase().includes(t) || (s.producto || '').toLowerCase().includes(t) || s.hosts.some((h) => String(h.hostname || '').toLowerCase().includes(t)) || s.reportes.some((r) => (r.hosts || []).some((x) => x.includes(t))))
-    .sort((a, b) => (b.sid.toLowerCase().startsWith(t) ? 1 : 0) - (a.sid.toLowerCase().startsWith(t) ? 1 : 0)).slice(0, 40);
+// indicador "en vivo"
+function hace(t) {
+  const s = (Date.now() - new Date(t)) / 1000;
+  if (s < 60) return 'hace un momento'; if (s < 3600) return `hace ${Math.floor(s / 60)} min`;
+  if (s < 86400) return `hace ${Math.floor(s / 3600)} h`; const d = Math.floor(s / 86400); return `hace ${d} ${d === 1 ? 'día' : 'días'}`;
 }
-function pintaLista() {
-  const o = opciones();
-  lista.innerHTML = o.length ? o.map((s, i) => `<a href="#/sistema/${encodeURIComponent(s.sid)}" class="${i === act ? 'act' : ''}" role="option"><span><b>${esc(s.sid)}</b> <span class="muted small">${esc(s.producto || '')}</span></span>${st(s.calif, ' ')}</a>`).join('') : '<div class="muted" style="padding:10px 12px">Sin coincidencias</div>';
-  lista.style.display = 'block';
+function pintarVivo() {
+  const v = $('#vivo'), cuando = D.publicacion ? D.publicacion.publicado_en : D.generado;
+  v.classList.toggle('local', !WEB);
+  $('#vivoTxt').textContent = `${WEB ? 'En línea' : 'Local'} · EWA ${fMes(estado.mes)}${cuando ? ' · ' + (WEB ? 'publicado ' : 'generado ') + hace(cuando) : ''}`;
+  v.dataset.tip = WEB ? `Conectado a la base de datos con acceso controlado.\n${D.publicacion ? `Publicación #${D.publicacion.id} por ${D.publicacion.publicado_por}\n${fHora(D.publicacion.publicado_en)}` : ''}${D.publicacion && D.publicacion.nota ? '\n' + D.publicacion.nota : ''}` : 'Datos locales de este equipo (datos/datos.js).';
 }
-busca.addEventListener('focus', () => { act = 0; pintaLista(); });
-busca.addEventListener('input', () => { act = 0; pintaLista(); });
-busca.addEventListener('keydown', (e) => {
-  const o = opciones();
-  if (e.key === 'ArrowDown') { act = Math.min(act + 1, o.length - 1); pintaLista(); e.preventDefault(); }
-  else if (e.key === 'ArrowUp') { act = Math.max(act - 1, 0); pintaLista(); e.preventDefault(); }
-  else if (e.key === 'Enter' && o[act]) { location.hash = '#/sistema/' + encodeURIComponent(o[act].sid); busca.value = ''; busca.blur(); }
-  else if (e.key === 'Escape') busca.blur();
-});
-busca.addEventListener('blur', () => setTimeout(() => { lista.style.display = 'none'; }, 150));
-lista.addEventListener('mousedown', (e) => { const a = e.target.closest('a'); if (a) { location.hash = a.getAttribute('href'); busca.value = ''; } });
+pintarVivo();
+setInterval(pintarVivo, 60000);
 
-// filtros, orden de tablas, CSV
+// panel lateral
+const drawer = $('#drawer'), velo = $('#velo');
+function abrirDrawer(sid) { drawer.innerHTML = contenidoDrawer(sid); drawer.classList.add('on'); velo.classList.add('on'); drawer.setAttribute('aria-hidden', 'false'); drawer.scrollTop = 0; animar(drawer); }
+function cerrarDrawer() { drawer.classList.remove('on'); velo.classList.remove('on'); drawer.setAttribute('aria-hidden', 'true'); }
+velo.addEventListener('click', cerrarDrawer);
+drawer.addEventListener('click', (e) => {
+  if (e.target.closest('[data-cerrar]')) return cerrarDrawer();
+  const d = e.target.closest('[data-drawer]'); if (d) abrirDrawer(d.dataset.drawer);
+  if (e.target.closest('a[href^="#/sistema/"]')) cerrarDrawer();
+});
+
+// paleta de comandos (Ctrl+K)
+const paleta = $('#paleta'), pIn = $('#paletaIn'), pRes = $('#paletaRes');
+let pAct = 0, pOps = [];
+const SECCIONES = [['Panorama', '#/panorama'], ['Sistemas', '#/sistemas'], ['Matriz de riesgo', '#/sistemas?vista=matriz'], ['Hallazgos', '#/hallazgos'], ['Hallazgos prioritarios', '#/hallazgos?prio=si'], ['Rendimiento', '#/rendimiento'], ['Ciclo de vida', '#/ciclo'], ['Inventario de servidores', '#/inventario'], ['Calidad de datos', '#/cobertura']];
+function opcionesPaleta(t) {
+  t = t.trim().toLowerCase();
+  const sids = SIDS.map(sis).filter((s) => !t || s.sid.toLowerCase().includes(t) || (s.producto || '').toLowerCase().includes(t)).sort((a, b) => (b.sid.toLowerCase().startsWith(t) ? 1 : 0) - (a.sid.toLowerCase().startsWith(t) ? 1 : 0)).slice(0, t ? 8 : 6)
+    .map((s) => ({ g: 'Sistemas', t: s.sid, d: s.producto, h: '#/sistema/' + encodeURIComponent(s.sid), st: s.calif }));
+  const hosts = t.length < 2 ? [] : inv.hosts.filter((h) => String(h.hostname || '').toLowerCase().includes(t) || String(h.ip || '').includes(t)).slice(0, 5).map((h) => ({ g: 'Servidores', t: h.hostname, d: `${h.sid} · ${h.ip || ''}`, h: '#/sistema/' + encodeURIComponent(h.sid) + '?t=infraestructura' }));
+  const vistos = new Set(), hall = [];
+  if (t.length >= 3) for (const r of reportes) for (const a of r.alertas || []) { const k = a.es || a.generico; if (!vistos.has(k) && k.toLowerCase().includes(t)) { vistos.add(k); hall.push({ g: 'Hallazgos', t: k, d: a.categoria, h: '#/hallazgos?q=' + encodeURIComponent(t) }); } }
+  const sec = SECCIONES.filter(([n]) => !t || n.toLowerCase().includes(t)).map(([n, h]) => ({ g: 'Secciones', t: n, h }));
+  return [...sids, ...hosts, ...hall.slice(0, 5), ...sec];
+}
+function pintarPaleta() {
+  pOps = opcionesPaleta(pIn.value); pAct = Math.min(pAct, Math.max(0, pOps.length - 1));
+  let g = '';
+  pRes.innerHTML = pOps.length ? pOps.map((o, i) => `${o.g !== g ? `<div class="grupo-t">${esc((g = o.g))}</div>` : ''}<div class="op ${i === pAct ? 'act' : ''}" data-i="${i}"><span>${o.st !== undefined ? st(o.st, ' ') : ''}<b>${esc(o.t)}</b> ${o.d ? `<small>${esc(o.d)}</small>` : ''}</span><small>↵</small></div>`).join('') : '<div class="muted" style="padding:14px">Sin coincidencias</div>';
+}
+function abrirPaleta() { paleta.classList.add('on'); pIn.value = ''; pAct = 0; pintarPaleta(); setTimeout(() => pIn.focus(), 10); }
+function cerrarPaleta() { paleta.classList.remove('on'); }
+$('#btnBuscar').addEventListener('click', abrirPaleta);
+pIn.addEventListener('input', () => { pAct = 0; pintarPaleta(); });
+pIn.addEventListener('keydown', (e) => {
+  if (e.key === 'ArrowDown') { pAct = Math.min(pAct + 1, pOps.length - 1); pintarPaleta(); e.preventDefault(); }
+  else if (e.key === 'ArrowUp') { pAct = Math.max(pAct - 1, 0); pintarPaleta(); e.preventDefault(); }
+  else if (e.key === 'Enter' && pOps[pAct]) { cerrarPaleta(); location.hash = pOps[pAct].h; }
+});
+pRes.addEventListener('click', (e) => { const o = e.target.closest('[data-i]'); if (o) { cerrarPaleta(); location.hash = pOps[+o.dataset.i].h; } });
+paleta.addEventListener('click', (e) => { if (e.target === paleta) cerrarPaleta(); });
+document.addEventListener('keydown', (e) => {
+  if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); paleta.classList.contains('on') ? cerrarPaleta() : abrirPaleta(); }
+  else if (e.key === 'Escape') { cerrarPaleta(); cerrarDrawer(); }
+  else if (e.key === '/' && !/input|textarea|select/i.test(document.activeElement.tagName) && !document.querySelector('dialog[open]')) { e.preventDefault(); abrirPaleta(); }
+});
+
+// filtros por URL, orden de tablas, CSV, navegación
 let tFiltro;
 app.addEventListener('input', (e) => {
-  const id = e.target.id;
-  if (!['fTxt', 'fInv'].includes(id)) return;
+  const el = e.target.closest('[data-qtext]'); if (!el) return;
   clearTimeout(tFiltro);
   tFiltro = setTimeout(() => {
-    const r = ruta(); r.q.set(id === 'fInv' ? 'q' : 'q', e.target.value); if (id === 'fInv') r.q.set('v', e.target.dataset.v);
-    if (!e.target.value) r.q.delete('q');
-    history.replaceState(null, '', `#/${r.v}?${r.q}`); render();
-    const el = document.getElementById(id); el.focus(); el.setSelectionRange(el.value.length, el.value.length);
-  }, 250);
+    const r = ruta(), k = el.dataset.qtext, pos = el.selectionStart;
+    navegar(`#/${r.v}${r.arg ? '/' + encodeURIComponent(r.arg) : ''}?${qLink(r.q, { [k]: el.value })}`, true);
+    const nuevo = app.querySelector(`[data-qtext="${k}"]`); if (nuevo) { nuevo.focus(); nuevo.setSelectionRange(pos, pos); }
+  }, 220);
 });
 app.addEventListener('change', (e) => {
-  if (!['fCat', 'fPrio', 'fSeg'].includes(e.target.id)) return;
-  const r = ruta(); const k = { fCat: 'cat', fPrio: 'prio', fSeg: 'seg' }[e.target.id];
-  e.target.value ? r.q.set(k, e.target.value) : r.q.delete(k);
-  location.hash = `#/${r.v}?${r.q}`;
+  const s = e.target.closest('[data-qsel]'); if (!s) return;
+  const r = ruta(); navegar(`#/${r.v}?${qLink(r.q, { [s.dataset.qsel]: s.value })}`, true);
 });
 app.addEventListener('click', (e) => {
   const th = e.target.closest('th[data-t]');
   if (th) { const t = TABLAS[th.dataset.t]; if (!t) return; t.st.dir = t.st.orden === th.dataset.k ? -t.st.dir : 1; t.st.orden = th.dataset.k; const y = window.scrollY; render(); window.scrollTo(0, y); return; }
-  const b = e.target.closest('[data-csv]');
-  if (b) csv(b.dataset.csv, b.dataset.n);
-  if (e.target.closest('[data-print]')) window.print();
-  const sg = e.target.closest('[data-seg]');
-  if (sg && puedeEditar()) editarSeg(sg.dataset.seg, sg.dataset.h);
+  const qk = e.target.closest('[data-qk]');
+  if (qk) { const r = ruta(), actual = r.q.get(qk.dataset.qk) || ''; navegar(`#/${r.v}${r.arg ? '/' + encodeURIComponent(r.arg) : ''}?${qLink(r.q, { [qk.dataset.qk]: actual === qk.dataset.qv ? '' : qk.dataset.qv })}`, true); return; }
+  const b = e.target.closest('[data-csv]'); if (b) return csv(b.dataset.csv, b.dataset.n);
+  if (e.target.closest('[data-print]')) return window.print();
+  const sg = e.target.closest('[data-seg]'); if (sg && puedeEditar()) return editarSeg(sg.dataset.seg, sg.dataset.h);
+  const dr = e.target.closest('[data-drawer]'); if (dr && !e.target.closest('a')) return abrirDrawer(dr.dataset.drawer);
+  const hr = e.target.closest('[data-href]'); if (hr) return (location.hash = hr.dataset.href);
 });
 
 // tooltip
 const tip = $('#tip');
 document.addEventListener('mousemove', (e) => {
   const el = e.target.closest('[data-tip]');
-  if (!el) { tip.style.display = 'none'; return; }
+  if (!el || !el.dataset.tip) { tip.style.display = 'none'; return; }
   tip.innerHTML = esc(el.dataset.tip).replace(/\n/g, '<br>');
   tip.style.display = 'block';
   const w = tip.offsetWidth, h = tip.offsetHeight;
@@ -853,10 +1023,8 @@ document.addEventListener('mousemove', (e) => {
   tip.style.top = (e.clientY + 16 + h > innerHeight ? e.clientY - h - 10 : e.clientY + 16) + 'px';
 });
 
-$('#pie').innerHTML = WEB
-  ? `${D.publicacion ? `Publicación #${esc(D.publicacion.id)} del ${esc(new Date(D.publicacion.publicado_en).toLocaleString('es-MX'))} por ${esc(D.publicacion.publicado_por)} · ` : ''}${D.generado ? 'datos generados el ' + esc(new Date(D.generado).toLocaleString('es-MX')) + ' · ' : ''}${reportes.length} EWAs en histórico · acceso controlado · Información confidencial DXC / KOF`
-  : `Datos generados el ${esc(new Date(D.generado).toLocaleString('es-MX'))} · ${reportes.length} EWAs en histórico · procesamiento 100% local en este equipo · Información confidencial DXC / KOF`;
-document.querySelectorAll('#tabs a[data-rol]').forEach((a) => { a.hidden = !(YO && a.dataset.rol.split(',').includes(YO.rol)); });
+$('#pie').innerHTML = `${reportes.length} EarlyWatch Alerts en histórico · ${inv.archivo ? 'inventario ' + esc(inv.archivo) + ' · ' : ''}${WEB ? 'acceso controlado por roles' : 'procesamiento local en este equipo'} · Información confidencial DXC / KOF`;
+document.querySelectorAll('#tabs [data-rol]').forEach((a) => { a.hidden = !(YO && a.dataset.rol.split(',').includes(YO.rol)); });
 render();
 } // fin arrancar
 
